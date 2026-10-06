@@ -270,6 +270,11 @@ async fn resolve_station(state: &AppState, id: &str) -> Result<ResolvedStation, 
             search_unavailable()
         })?
         .ok_or_else(unknown)?;
+    // Never trust the answer to be the station that was asked for.
+    if found.id() != id {
+        warn!("Radio Browser answered {} for a lookup of {}", found.id(), id);
+        return Err(unknown());
+    }
     state
         .stations
         .write()

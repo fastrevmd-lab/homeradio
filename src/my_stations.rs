@@ -101,16 +101,27 @@ impl MyStore {
         Self { path, entries }
     }
 
+    /// Parses the file entry by entry, so one bad entry costs only itself. A
+    /// file that is not a JSON array at all is renamed to `<name>.corrupt`
+    /// before loading as empty, so the next save cannot overwrite the only copy.
     fn parse(contents: &str, path: &Path) -> Vec<MyEntry> {
-        let parsed: Vec<MyEntry> = match serde_json::from_str(contents) {
-            Ok(parsed) => parsed,
+        let raw_entries: Vec<serde_json::Value> = match serde_json::from_str(contents) {
+            Ok(raw_entries) => raw_entries,
             Err(error) => {
                 warn!("{} is corrupt ({}); starting with an empty MY list", path.display(), error);
+                Self::preserve_corrupt_file(path);
                 return Vec::new();
             }
         };
         let mut entries: Vec<MyEntry> = Vec::new();
-        for entry in parsed {
+        for raw_entry in raw_entries {
+            let entry: MyEntry = match serde_json::from_value(raw_entry) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn!("Dropping unreadable MY entry: {}", error);
+                    continue;
+                }
+            };
             if !entry.is_well_formed() {
                 warn!("Dropping malformed MY entry {:?}", entry.id());
                 continue;
@@ -122,6 +133,18 @@ impl MyStore {
         }
         entries.truncate(MY_CAP);
         entries
+    }
+
+    fn preserve_corrupt_file(path: &Path) {
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "my-stations.json".to_string());
+        let corrupt_path = path.with_file_name(format!("{file_name}.corrupt"));
+        match std::fs::rename(path, &corrupt_path) {
+            Ok(()) => warn!("Moved the corrupt MY file to {}", corrupt_path.display()),
+            Err(error) => warn!("Could not preserve the corrupt MY file: {}", error),
+        }
     }
 
     /// All entries, oldest first.
@@ -336,6 +359,39 @@ mod tests {
         std::fs::write(dir.path().join("my-stations.json"), json.to_string()).unwrap();
         let ids: Vec<String> = store_in(&dir).entries().iter().map(|e| e.id().to_string()).collect();
         assert_eq!(ids, vec!["big100".to_string(), format!("rb-{UUID_A}")]);
+    }
+
+    #[test]
+    fn one_bad_entry_does_not_discard_the_good_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = serde_json::json!([
+            {"ref": "big100"},
+            {"unexpected": "shape"},
+            42,
+            {"id": format!("rb-{UUID_A}"), "name": "Ok", "short": "Ok", "genre": "", "url": "http://ok.example/s"}
+        ]);
+        std::fs::write(dir.path().join("my-stations.json"), json.to_string()).unwrap();
+        let ids: Vec<String> = store_in(&dir).entries().iter().map(|e| e.id().to_string()).collect();
+        assert_eq!(ids, vec!["big100".to_string(), format!("rb-{UUID_A}")]);
+        assert!(!dir.path().join("my-stations.json.corrupt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_file_is_preserved_so_the_next_save_cannot_destroy_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("my-stations.json"), "{ this is not json").unwrap();
+        let mut store = store_in(&dir);
+        assert!(store.entries().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("my-stations.json.corrupt")).unwrap(),
+            "{ this is not json"
+        );
+        store.add(reference("big100")).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("my-stations.json.corrupt")).unwrap(),
+            "{ this is not json"
+        );
+        assert_eq!(store_in(&dir).entries(), &[reference("big100")]);
     }
 
     #[tokio::test]

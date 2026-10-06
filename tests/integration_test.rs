@@ -397,6 +397,10 @@ struct FakeRadioBrowser {
     stations: Vec<radiobrowser::RbStation>,
     down: std::sync::atomic::AtomicBool,
     by_uuid_calls: std::sync::atomic::AtomicUsize,
+    /// When set, `by_uuid` answers with the first station whatever uuid was asked for.
+    answer_wrong_station: std::sync::atomic::AtomicBool,
+    /// Artificial delay before `by_uuid` answers, in milliseconds.
+    by_uuid_delay_ms: std::sync::atomic::AtomicU64,
     searches: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
 }
 
@@ -406,6 +410,8 @@ impl FakeRadioBrowser {
             stations,
             down: std::sync::atomic::AtomicBool::new(false),
             by_uuid_calls: std::sync::atomic::AtomicUsize::new(0),
+            answer_wrong_station: std::sync::atomic::AtomicBool::new(false),
+            by_uuid_delay_ms: std::sync::atomic::AtomicU64::new(0),
             searches: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -416,6 +422,10 @@ impl FakeRadioBrowser {
 
     fn is_down(&self) -> bool {
         self.down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_answer_wrong_station(&self, wrong: bool) {
+        self.answer_wrong_station.store(wrong, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn by_uuid_call_count(&self) -> usize {
@@ -442,8 +452,15 @@ impl radiobrowser::RadioBrowser for FakeRadioBrowser {
 
     async fn by_uuid(&self, uuid: &str) -> Result<Option<radiobrowser::RbStation>, radiobrowser::RbError> {
         self.by_uuid_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay_ms = self.by_uuid_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
         if self.is_down() {
             return Err(radiobrowser::RbError::Unavailable("fake outage".to_string()));
+        }
+        if self.answer_wrong_station.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(self.stations.first().cloned());
         }
         Ok(self.stations.iter().find(|station| station.uuid == uuid).cloned())
     }
@@ -2657,6 +2674,30 @@ async fn play_rejects_ids_that_are_not_known_stations() {
     assert_eq!(app.radio_browser.by_uuid_call_count(), 1);
     let player_state = cliamp::Player::state(app.player.as_ref()).await;
     assert_eq!(player_state.url, None);
+}
+
+#[tokio::test]
+async fn a_lookup_that_answers_with_another_station_is_unknown_and_never_cached() {
+    let app = discovery_app().await;
+    app.radio_browser.set_answer_wrong_station(true);
+    let blues_id = format!("rb-{BLUES_UUID}");
+
+    let played = app.server.post("/api/play").json(&json!({"station": blues_id})).await;
+    played.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(played.json::<serde_json::Value>()["error"], "unknown_station");
+
+    let kept = app.server.post("/api/my").json(&json!({"station": blues_id})).await;
+    kept.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(kept.json::<serde_json::Value>()["error"], "unknown_station");
+
+    let stations = app.state.stations.read().await;
+    assert!(stations.cached_search_result(&blues_id).is_none());
+    assert!(stations.cached_search_result(&format!("rb-{JAZZ_UUID}")).is_none());
+    drop(stations);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url, None);
+    let body: serde_json::Value = app.server.get("/api/stations").await.json();
+    assert_eq!(my_ids(&body), Vec::<String>::new());
 }
 
 #[tokio::test]

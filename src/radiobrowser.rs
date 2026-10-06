@@ -314,8 +314,15 @@ impl RadioBrowser for HttpRadioBrowser {
         let url = reqwest::Url::parse(&by_uuid_url(&self.base, uuid))
             .map_err(|error| RbError::Unavailable(error.to_string()))?;
         let entries = self.get_entries(url).await?;
-        Ok(filter_stations(parse_raw_stations(entries), 1).into_iter().next())
+        Ok(pick_by_uuid(parse_raw_stations(entries), uuid))
     }
+}
+
+/// The playable station whose uuid is exactly `uuid`. The server is not
+/// trusted to return only that station, and a first-passing entry with another
+/// uuid must never be played or saved under the requested id.
+pub(crate) fn pick_by_uuid(raw: Vec<RawStation>, uuid: &str) -> Option<RbStation> {
+    filter_stations(raw, usize::MAX).into_iter().find(|station| station.uuid == uuid)
 }
 
 #[cfg(test)]
@@ -509,6 +516,18 @@ mod tests {
             parse_server_names(&entries),
             vec!["de1.api.radio-browser.info".to_string(), "fi1.api.radio-browser.info".to_string()]
         );
+    }
+
+    #[test]
+    fn pick_by_uuid_ignores_other_stations_in_the_response() {
+        let entries = || {
+            parse_raw_stations(vec![
+                good_entry(UUID_A, "Other", "http://a.example/s"),
+                good_entry(UUID_B, "Wanted", "http://b.example/s"),
+            ])
+        };
+        assert_eq!(pick_by_uuid(entries(), UUID_B).unwrap().name, "Wanted");
+        assert_eq!(pick_by_uuid(entries(), "33333333-3333-3333-3333-333333333333"), None);
     }
 
     #[tokio::test]
