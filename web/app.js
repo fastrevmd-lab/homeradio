@@ -2,12 +2,19 @@
 let stations = { groups: [] };
 let currentState = null;
 let currentBand = 'rock';
+const BANDS = ['rock', 'cliamp', 'my'];
+const PRESET_SLOTS = 7;
 let selectedStationIndex = 0;
 let isDraggingDial = false;
 let isDraggingKnob = false;
 let activeKnob = null;
 let eventSource = null;
 let lastSeenStation = null; // band auto-follow only when this changes
+let lastPlayedId = null; // the star's target while nothing is playing
+let stationsRevision = 0; // revision of the Stations snapshot on screen; older ones (same boot) are ignored
+let stationsBoot = null; // server boot id of that snapshot; a new boot resets the revision
+const retiredStationsBoots = new Set(); // boots replaced by a newer one; their late snapshots are ignored
+let stationsStale = false; // the event stream dropped: refetch stations once it is back
 let pendingFollowStation = null; // station change that arrived mid-drag; applied on drag end
 let lcdHoldActive = false;  // an error message currently owns the LCD
 let lcdHoldTimer = null;
@@ -22,6 +29,17 @@ const elements = {
     dialScale: document.getElementById('dialScale'),
     dialControl: document.getElementById('dialControl'),
     bandSwitch: document.getElementById('bandSwitch'),
+    bandOptions: Array.from(document.querySelectorAll('.band-option')),
+    lcdStar: document.getElementById('lcdStar'),
+    boombox: document.querySelector('.boombox'),
+    searchBtn: document.getElementById('searchBtn'),
+    searchBackdrop: document.getElementById('searchBackdrop'),
+    searchDrawer: document.getElementById('searchDrawer'),
+    searchClose: document.getElementById('searchClose'),
+    searchInput: document.getElementById('searchInput'),
+    searchChips: document.getElementById('searchChips'),
+    searchStatus: document.getElementById('searchStatus'),
+    searchResults: document.getElementById('searchResults'),
     presetButtons: document.getElementById('presetButtons'),
     playBtn: document.getElementById('playBtn'),
     stopBtn: document.getElementById('stopBtn'),
@@ -87,15 +105,27 @@ async function apiCall(method, path, body = null) {
         const data = await response.json();
 
         if (!response.ok) {
-            showError(data.detail || data.error || 'Request failed');
+            showRequestError(data.detail || data.error || 'Request failed');
             return null;
         }
 
         return data;
     } catch (error) {
-        showError('Network error: ' + error.message);
+        showRequestError('Network error: ' + error.message);
         return null;
     }
+}
+
+/**
+ * Report a failed request. The LCD shows it, but the search drawer covers the
+ * LCD, so while the drawer is open the drawer's status line says it too.
+ * (Only request failures: the receiver's own error is re-sent on every state
+ * push and would keep overwriting the search status.)
+ * @param {string} message the error text
+ */
+function showRequestError(message) {
+    showError(message);
+    if (isSearchOpen()) setSearchStatus(message);
 }
 
 // Initialize
@@ -106,6 +136,8 @@ async function init() {
     const stationsData = await apiCall('GET', '/stations');
     if (stationsData) {
         stations = stationsData;
+        stationsRevision = stationsData.revision ?? 0;
+        stationsBoot = stationsData.boot ?? null;
         renderPresetButtons();
     }
     refreshDial();
@@ -136,28 +168,118 @@ function setupEventSource() {
         updateUI(state);
     });
 
+    // Another browser changed MY: the event carries the whole Stations payload
+    eventSource.addEventListener('stations', (event) => {
+        applyStations(JSON.parse(event.data));
+    });
+
     eventSource.onerror = () => {
         showError('Connection lost, reconnecting...');
-        // EventSource will auto-reconnect
+        // EventSource will auto-reconnect; MY events missed meanwhile are refetched then
+        stationsStale = true;
+    };
+
+    eventSource.onopen = () => {
+        if (!stationsStale) return;
+        refetchStations();
     };
 }
 
-// Render preset buttons (first 7 rock stations) using DOM APIs only (no HTML strings)
-function renderPresetButtons() {
-    const rockGroup = stations.groups.find(g => g.id === 'rock');
-    if (!rockGroup) return;
+/**
+ * Fetch the station registry again and repaint it (after a dropped event stream).
+ * The stale flag is cleared only once a refetch succeeded, so a failed one is
+ * retried on the next reconnect.
+ */
+async function refetchStations() {
+    const data = await apiCall('GET', '/stations');
+    if (!data) return;
+    applyStations(data);
+    stationsStale = false;
+}
 
-    const buttons = rockGroup.stations.slice(0, 7).map((station, index) => {
+/**
+ * Adopt a new Stations payload (from a MY change here or elsewhere) and repaint
+ * everything that depends on it, keeping the station the dial was on.
+ * A snapshot older than the one already shown (by `revision`) is ignored, so
+ * out-of-order SSE events, responses and refetches cannot roll the UI back.
+ * Revisions are only comparable within one server `boot`: a snapshot from a
+ * different boot (the server restarted) is accepted and resets the remembered
+ * revision, and the boot it replaces is retired: a late snapshot from a retired
+ * boot (a response still in flight across the restart) is ignored.
+ * @param {?{groups: Array, revision?: number, boot?: string}} data the Stations JSON, or null when a request failed
+ */
+function applyStations(data) {
+    if (!data || !Array.isArray(data.groups)) return;
+    if (typeof data.revision === 'number') {
+        const boot = data.boot ?? null;
+        if (retiredStationsBoots.has(boot)) return;
+        const sameBoot = boot === stationsBoot;
+        if (sameBoot && data.revision < stationsRevision) return;
+        if (!sameBoot) retiredStationsBoots.add(stationsBoot);
+        stationsRevision = data.revision;
+        stationsBoot = boot;
+    }
+    const selectedId = getCurrentGroup()?.stations[selectedStationIndex]?.id;
+    stations = data;
+    const keptIndex = selectedId ? (getCurrentGroup()?.stations.findIndex(s => s.id === selectedId) ?? -1) : -1;
+    if (keptIndex !== -1) selectedStationIndex = keptIndex;
+    renderPresetButtons();
+    refreshDial();
+    renderStar();
+    refreshSearchStars();
+}
+
+/** @returns {boolean} whether the station is in the MY list */
+function isInMy(stationId) {
+    return stations.groups.find(g => g.id === 'my')?.stations.some(s => s.id === stationId) ?? false;
+}
+
+/** Add the station to MY, or remove it when it is already there. */
+async function toggleMy(stationId, isSaved) {
+    const data = isSaved
+        ? await apiCall('DELETE', `/my/${encodeURIComponent(stationId)}`)
+        : await apiCall('POST', '/my', { station: stationId });
+    applyStations(data);
+}
+
+/** @returns {?string} the station the LCD star acts on: the current one, else the last played */
+function starTargetId() {
+    return currentState?.player.station ?? lastPlayedId;
+}
+
+// Paint the LCD star: disabled with no station yet, filled when the station is in MY
+function renderStar() {
+    const targetId = starTargetId();
+    const isSaved = targetId ? isInMy(targetId) : false;
+    elements.lcdStar.disabled = !targetId;
+    elements.lcdStar.setAttribute('aria-pressed', String(isSaved));
+    // The label stays constant; aria-pressed carries the state.
+}
+
+// Render the 7 preset keys for the current band using DOM APIs only (no HTML
+// strings). A band with fewer than 7 stations leaves the extra keys blank and disabled.
+function renderPresetButtons() {
+    const presetStations = (getCurrentGroup()?.stations ?? []).slice(0, PRESET_SLOTS);
+
+    const buttons = Array.from({ length: PRESET_SLOTS }, (_, index) => {
+        const station = presetStations[index];
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'preset-btn';
-        button.dataset.station = station.id;
         button.dataset.index = String(index);
+        if (!station) {
+            button.disabled = true;
+            button.setAttribute('aria-label', 'Empty preset');
+            return button;
+        }
+        button.dataset.station = station.id;
         button.textContent = station.short;
+        button.title = station.name;
         button.addEventListener('click', () => playStation(station.id));
         return button;
     });
     elements.presetButtons.replaceChildren(...buttons);
+    updatePresetSelection(currentState?.player.station ?? null);
 }
 
 // Dial label layout (computed in renderDialScale, applied by updateDialLabels)
@@ -180,7 +302,9 @@ function renderDialScale() {
         dialLayout = null;
         const empty = document.createElement('div');
         empty.className = 'dial-empty';
-        empty.textContent = 'NO STATIONS';
+        const isEmptyMyBand = currentBand === 'my';
+        empty.classList.toggle('dial-hint', isEmptyMyBand);
+        empty.textContent = isEmptyMyBand ? '\u2605 a station to keep it here' : 'NO STATIONS';
         elements.dialScale.replaceChildren(empty);
         return;
     }
@@ -287,8 +411,10 @@ function updateUI(state) {
         }
     }
 
-    // Preset button selection
+    // Preset button selection and the LCD star
     updatePresetSelection(stationId);
+    if (stationId) lastPlayedId = stationId;
+    renderStar();
 
     // Zones
     if (state.zones) {
@@ -607,24 +733,59 @@ function refreshDial() {
     positionNeedle();
 }
 
-// Move the dial to a newly playing station, switching band if it lives in the other one
+/**
+ * Make `band` the current one and repaint the switch (thumb position, aria-checked,
+ * roving tabindex). Does not touch the presets or the dial.
+ * @param {string} band one of BANDS
+ * @param {boolean} [focus] move keyboard focus to the newly checked segment
+ */
+function paintBandSwitch(band, focus = false) {
+    currentBand = band;
+    elements.bandSwitch.dataset.band = band;
+    for (const option of elements.bandOptions) {
+        const isChecked = option.dataset.band === band;
+        option.setAttribute('aria-checked', String(isChecked));
+        option.tabIndex = isChecked ? 0 : -1;
+        if (isChecked && focus) option.focus();
+    }
+}
+
+/**
+ * Switch band by the user's choice: the presets and dial follow it, and the dial
+ * starts on the playing station when that station is in the band.
+ * @param {string} band one of BANDS
+ * @param {{focus?: boolean}} [options]
+ */
+function setBand(band, { focus = false } = {}) {
+    if (!BANDS.includes(band)) return;
+    paintBandSwitch(band, focus);
+    const playingId = currentState?.player.station;
+    const group = getCurrentGroup();
+    const playingIndex = playingId && group ? group.stations.findIndex(s => s.id === playingId) : -1;
+    selectedStationIndex = playingIndex === -1 ? 0 : playingIndex;
+    renderPresetButtons();
+    refreshDial();
+}
+
+// Move the dial to a newly playing station, switching band if it lives in another one.
+// The current band wins when the station is in several (a MY entry that is also a preset).
 function followStation(stationId) {
-    const inCurrent = getCurrentGroup()?.stations.findIndex(s => s.id === stationId) ?? -1;
-    if (inCurrent !== -1) {
-        selectedStationIndex = inCurrent;
-        positionNeedle();
+    const searchOrder = [currentBand, ...BANDS.filter(band => band !== currentBand)];
+    for (const band of searchOrder) {
+        const group = stations.groups.find(g => g.id === band);
+        const index = group ? group.stations.findIndex(s => s.id === stationId) : -1;
+        if (index === -1) continue;
+        if (band === currentBand) {
+            selectedStationIndex = index;
+            positionNeedle();
+            return;
+        }
+        paintBandSwitch(band);
+        renderPresetButtons();
+        selectedStationIndex = index;
+        refreshDial();
         return;
     }
-
-    const otherBand = currentBand === 'rock' ? 'cliamp' : 'rock';
-    const otherGroup = stations.groups.find(g => g.id === otherBand);
-    const inOther = otherGroup ? otherGroup.stations.findIndex(s => s.id === stationId) : -1;
-    if (inOther === -1) return;
-
-    currentBand = otherBand;
-    elements.bandSwitch.checked = otherBand === 'cliamp';
-    selectedStationIndex = inOther;
-    refreshDial();
 }
 
 // Update preset button selection
@@ -640,7 +801,10 @@ function updatePresetSelection(stationId) {
 // the knob's real minimum (zone.min_db) is still reachable. Values are never
 // clamped to a "nicer" floor, so the knob never misreports the actual level.
 const KNOB_CURVE = 2;
-const KNOB_SWEEP_DEGREES = 270;
+// Half a turn: the indicator rests at 3 o'clock at the minimum and travels
+// clockwise, round the bottom, to 9 o'clock at the cap.
+const KNOB_SWEEP_DEGREES = 180;
+const KNOB_REST_DEGREES = 90;
 // One drag gesture may move the level at most this many dB per pixel of travel
 // (6 dB per 20 px), whatever the taper says.
 const KNOB_MAX_DB_PER_PIXEL = 6 / 20;
@@ -656,7 +820,7 @@ function positionToDb(position, minDb, capDb) {
 }
 
 function positionToAngle(position) {
-    return position * KNOB_SWEEP_DEGREES - KNOB_SWEEP_DEGREES / 2;
+    return KNOB_REST_DEGREES + position * KNOB_SWEEP_DEGREES;
 }
 
 function isKnobDisabled(knob) {
@@ -806,13 +970,26 @@ function showLoading() {
 // Event listeners
 function setupEventListeners() {
     // Band switch: an explicit choice sticks until the playing station changes
-    elements.bandSwitch.addEventListener('change', (e) => {
-        currentBand = e.target.checked ? 'cliamp' : 'rock';
-        const playingId = currentState?.player.station;
-        const group = getCurrentGroup();
-        const playingIndex = playingId && group ? group.stations.findIndex(s => s.id === playingId) : -1;
-        selectedStationIndex = playingIndex === -1 ? 0 : playingIndex;
-        refreshDial();
+    elements.bandSwitch.addEventListener('click', (event) => {
+        const option = event.target.closest('.band-option');
+        // Re-clicking the current band must not reset the tuned dial
+        if (option && option.dataset.band !== currentBand) setBand(option.dataset.band);
+    });
+    // Radiogroup keys: arrows move to the neighbouring band, wrapping round
+    elements.bandSwitch.addEventListener('keydown', (event) => {
+        // Alt/Ctrl/Meta+Arrow belongs to the browser (Back/Forward, word jumps)
+        if (event.altKey || event.ctrlKey || event.metaKey) return;
+        const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[event.key];
+        if (step === undefined) return;
+        event.preventDefault();
+        const nextIndex = (BANDS.indexOf(currentBand) + step + BANDS.length) % BANDS.length;
+        setBand(BANDS[nextIndex], { focus: true });
+    });
+
+    // LCD star: keep the current station in MY, or take it out again
+    elements.lcdStar.addEventListener('click', () => {
+        const targetId = starTargetId();
+        if (targetId) toggleMy(targetId, isInMy(targetId));
     });
 
     // Play button
@@ -841,6 +1018,9 @@ function setupEventListeners() {
     // Dial control
     setupDialControl();
 
+    // Search drawer
+    setupSearch();
+
     // Volume knobs
     setupVolumeKnob('main', elements.mainKnob);
     setupVolumeKnob('zone2', elements.zone2Knob);
@@ -849,6 +1029,203 @@ function setupEventListeners() {
     window.addEventListener('resize', debounce(() => { refreshDial(); resizeVisCanvas(); }, 250));
     if (typeof ResizeObserver === 'function') new ResizeObserver(debounce(resizeVisCanvas, 100)).observe(elements.visCanvas);
     resizeVisCanvas();
+}
+
+// ---------------------------------------------------------------------------
+// Search drawer: open/close, focus handling
+// ---------------------------------------------------------------------------
+
+/** @returns {boolean} whether the search drawer is showing */
+function isSearchOpen() {
+    return !elements.searchDrawer.hidden;
+}
+
+/** Show the drawer, make the boom box inert behind it and focus the search box. */
+function openSearch() {
+    if (isSearchOpen()) return;
+    elements.searchDrawer.hidden = false;
+    elements.searchBackdrop.hidden = false;
+    elements.boombox.inert = true;
+    elements.searchBtn.setAttribute('aria-expanded', 'true');
+    elements.searchInput.focus();
+}
+
+/** Hide the drawer and hand focus back to the 🔍 button. */
+function closeSearch() {
+    if (!isSearchOpen()) return;
+    elements.searchDrawer.hidden = true;
+    elements.searchBackdrop.hidden = true;
+    elements.boombox.inert = false;
+    elements.searchBtn.setAttribute('aria-expanded', 'false');
+    elements.searchBtn.focus();
+}
+
+/** Keep Tab and Shift+Tab inside the open drawer. */
+function trapSearchFocus(event) {
+    const focusable = Array.from(
+        elements.searchDrawer.querySelectorAll('button:not(:disabled), input:not(:disabled)')
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search drawer: genre chips, debounced search, result rows
+//
+// Everything Radio Browser sends us is untrusted text, so rows are built with
+// createElement and textContent only, never HTML strings.
+// ---------------------------------------------------------------------------
+const SEARCH_GENRES = ['Rock', 'Classic Rock', 'Alt', 'Jazz', 'Blues', 'Country', 'Oldies', 'Classical', 'Lofi', 'News', 'Talk'];
+const SEARCH_MIN_CHARS = 2;
+const SEARCH_DEBOUNCE_MS = 300;
+const SEARCH_IDLE_HINT = 'Type a name or pick a genre.';
+let searchGenre = null; // the selected chip, or null
+let searchRequestId = 0; // a response only counts while its request is the latest
+
+/** Show one line of status text under the chips (empty clears it). */
+function setSearchStatus(text) {
+    elements.searchStatus.textContent = text;
+}
+
+/** Build the genre chips: tapping one selects it, tapping it again clears it. */
+function buildGenreChips() {
+    const chips = SEARCH_GENRES.map((genre) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'search-chip';
+        chip.textContent = genre;
+        chip.setAttribute('aria-pressed', 'false');
+        chip.addEventListener('click', () => {
+            searchGenre = searchGenre === genre ? null : genre;
+            for (const other of elements.searchChips.children) {
+                other.setAttribute('aria-pressed', String(other.textContent === searchGenre));
+            }
+            runSearch();
+        });
+        return chip;
+    });
+    elements.searchChips.replaceChildren(...chips);
+}
+
+/**
+ * One result row: name, a "genre · country · bitrate" line, then ▶ and ★.
+ * @param {{id: string, name: string, genre: string, country: string, bitrate: number}} result
+ * @returns {HTMLLIElement}
+ */
+function createResultRow(result) {
+    const row = document.createElement('li');
+    row.className = 'search-row';
+
+    const info = document.createElement('div');
+    info.className = 'search-info';
+    const name = document.createElement('span');
+    name.className = 'search-name';
+    name.textContent = result.name;
+    const meta = document.createElement('span');
+    meta.className = 'search-meta';
+    meta.textContent = [result.genre, result.country, result.bitrate ? `${result.bitrate} kbps` : '']
+        .filter(Boolean).join(' · ');
+    info.append(name, meta);
+
+    const play = document.createElement('button');
+    play.type = 'button';
+    play.className = 'search-play';
+    play.textContent = '▶';
+    play.setAttribute('aria-label', `Play ${result.name}`);
+    play.addEventListener('click', () => playStation(result.id));
+
+    const star = document.createElement('button');
+    star.type = 'button';
+    star.className = 'search-star';
+    star.textContent = '★';
+    star.dataset.id = result.id;
+    star.setAttribute('aria-label', `Keep ${result.name} in MY`);
+    star.addEventListener('click', () => toggleMy(result.id, isInMy(result.id)));
+
+    row.append(info, play, star);
+    return row;
+}
+
+/** Repaint each result's ★ from the MY list, in place so keyboard focus stays put. */
+function refreshSearchStars() {
+    for (const star of elements.searchResults.querySelectorAll('.search-star')) {
+        star.setAttribute('aria-pressed', String(isInMy(star.dataset.id)));
+    }
+}
+
+/** Replace the result list. */
+function renderSearchResults(results) {
+    elements.searchResults.replaceChildren(...results.map(createResultRow));
+    refreshSearchStars();
+}
+
+/** Run the search for the box text and the selected chip, and show the outcome. */
+async function runSearch() {
+    const requestId = ++searchRequestId;
+    const query = elements.searchInput.value.trim();
+    const useQuery = query.length >= SEARCH_MIN_CHARS;
+    if (!useQuery && !searchGenre) {
+        elements.searchResults.removeAttribute('aria-busy');
+        renderSearchResults([]);
+        setSearchStatus(SEARCH_IDLE_HINT);
+        return;
+    }
+
+    const params = new URLSearchParams();
+    if (useQuery) params.set('q', query);
+    if (searchGenre) params.set('genre', searchGenre);
+    setSearchStatus('Searching…');
+    elements.searchResults.setAttribute('aria-busy', 'true');
+
+    let results = null;
+    try {
+        const response = await fetch(`/api/search?${params}`);
+        if (response.ok) results = (await response.json()).results;
+    } catch (error) {
+        results = null;
+    }
+    if (requestId !== searchRequestId) return; // a newer search took over
+    elements.searchResults.removeAttribute('aria-busy');
+
+    if (!Array.isArray(results)) {
+        renderSearchResults([]);
+        setSearchStatus('Search unavailable');
+        return;
+    }
+    renderSearchResults(results);
+    setSearchStatus(results.length === 0 ? 'No stations found' : '');
+}
+
+const scheduleSearch = debounce(runSearch, SEARCH_DEBOUNCE_MS);
+
+/** Wire the drawer: 🔍 opens it; Escape, the close button or the backdrop close it. */
+function setupSearch() {
+    buildGenreChips();
+    setSearchStatus(SEARCH_IDLE_HINT);
+    elements.searchInput.addEventListener('input', () => {
+        searchRequestId++; // whatever is in flight is for text that is gone
+        scheduleSearch();
+    });
+    elements.searchBtn.addEventListener('click', openSearch);
+    elements.searchClose.addEventListener('click', closeSearch);
+    elements.searchBackdrop.addEventListener('click', closeSearch);
+    document.addEventListener('keydown', (event) => {
+        if (!isSearchOpen()) return;
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            closeSearch();
+        } else if (event.key === 'Tab') {
+            trapSearchFocus(event);
+        }
+    });
 }
 
 // Dial control setup
@@ -1004,7 +1381,8 @@ function setupVolumeKnob(zoneId, knob) {
         if (!isDraggingKnob || activeKnob !== knob) return;
 
         const { minDb, capDb, stepDb } = knobRange();
-        const positionDelta = ((startY - e.clientY) * DEGREES_PER_PIXEL) / KNOB_SWEEP_DEGREES;
+        // Pulling down turns the knob clockwise (louder), like dragging its right edge
+        const positionDelta = ((e.clientY - startY) * DEGREES_PER_PIXEL) / KNOB_SWEEP_DEGREES;
         const rawDb = positionToDb(startPosition + positionDelta, minDb, capDb);
         // Never travel faster than KNOB_MAX_DB_PER_PIXEL from where the drag began
         const maxTravelDb = Math.abs(startY - e.clientY) * KNOB_MAX_DB_PER_PIXEL;

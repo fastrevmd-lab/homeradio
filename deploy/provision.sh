@@ -83,6 +83,9 @@ fi
 install -m 0755 radio-web /usr/local/bin/radio-web
 install -m 0644 stations.toml /etc/home-radio/stations.toml
 
+# The default cache_dir: holds the cliamp station cache and my-stations.json.
+install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0755 /var/lib/home-radio
+
 install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0755 \
   "$RADIO_HOME/.config" "$RADIO_HOME/.config/cliamp" "$RADIO_HOME/.cache" \
   "$RADIO_HOME/.cache/home-radio" "$RADIO_HOME/.config/pipewire" \

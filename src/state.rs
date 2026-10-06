@@ -348,9 +348,13 @@ impl StateManager {
 
     pub async fn refresh(&self) {
         let player_state = self.player.state().await;
-        let stations = self.stations.read().await;
-
-        let player_info = self.build_player_info(&player_state, &stations).await;
+        // The stations lock is held only while the player info is built: the
+        // receiver calls below can take seconds, and a waiting writer would
+        // stall every reader behind it.
+        let player_info = {
+            let stations = self.stations.read().await;
+            self.build_player_info(&player_state, &stations).await
+        };
 
         let (receiver_info, mut zones) = self.fetch_receiver_state().await;
 
@@ -393,13 +397,7 @@ impl StateManager {
         let station_identity = player_state.station_url.as_ref().or(player_state.url.as_ref());
         let station = if let Some(url) = station_identity {
             // Try to match by URL
-            let matched = stations
-                .get_registry()
-                .groups
-                .iter()
-                .flat_map(|g| &g.stations)
-                .find(|s| stations.get_station_url(&s.id) == Some(url))
-                .map(|s| s.id.clone());
+            let matched = stations.station_id_for_url(url);
 
             if matched.is_some() {
                 matched

@@ -104,10 +104,14 @@ async fn main() -> anyhow::Result<()> {
         play_mutex: Arc::new(tokio::sync::Mutex::new(())),
         policy_timing: api::PolicyTiming::default(),
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        command_seq: Arc::default(),
+        completed_command_seq: Arc::default(),
         route: Arc::new(route::SystemdAudioRoute::new(config.raop_unit.clone())),
         route_tracking: Arc::default(),
         policy_completions: Arc::default(),
         vis,
+        radio_browser: Arc::new(radiobrowser::HttpRadioBrowser::connect().await),
+        stations_tx: tokio::sync::broadcast::channel(16).0,
     };
 
     // Watch for a receiver that stops pulling audio while cliamp plays

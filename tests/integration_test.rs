@@ -23,6 +23,8 @@ struct MockYxcClient {
     fail_set_power_for: Option<String>,
     /// A zone whose `get_zone_status` calls fail as unreachable.
     fail_status_for: Option<String>,
+    /// Artificial delay before `get_play_info` answers, in milliseconds.
+    play_info_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Arms a delayed AirPlay takeover: after `polls_left` more `get_zone_status`
@@ -94,6 +96,7 @@ impl MockYxcClient {
             override_volume_once: Arc::default(),
             fail_set_power_for: None,
             fail_status_for: None,
+            play_info_delay_ms: Arc::default(),
         }
     }
 
@@ -116,6 +119,7 @@ impl MockYxcClient {
             override_volume_once: Arc::default(),
             fail_set_power_for: None,
             fail_status_for: None,
+            play_info_delay_ms: Arc::default(),
         }
     }
 }
@@ -154,6 +158,10 @@ impl yxc::YxcClient for MockYxcClient {
     }
 
     async fn get_play_info(&self) -> Result<yxc::PlayInfo, yxc::YxcError> {
+        let delay_ms = self.play_info_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
         Ok(self.play_info.lock().await.clone())
     }
 
@@ -386,6 +394,114 @@ struct TestApp {
     route: Arc<MockAudioRoute>,
     player: Arc<MockPlayer>,
     events: Events,
+    radio_browser: Arc<FakeRadioBrowser>,
+    /// Owns the cache dir (and `my-stations.json`); gone when the test ends.
+    _cache_dir: Option<tempfile::TempDir>,
+}
+
+/// Radio Browser stand-in: serves a fixed list, can be switched off, and
+/// records what it was asked.
+struct FakeRadioBrowser {
+    stations: Vec<radiobrowser::RbStation>,
+    down: std::sync::atomic::AtomicBool,
+    by_uuid_calls: std::sync::atomic::AtomicUsize,
+    /// When set, `by_uuid` answers with the first station whatever uuid was asked for.
+    answer_wrong_station: std::sync::atomic::AtomicBool,
+    /// Artificial delay before `by_uuid` answers, in milliseconds.
+    by_uuid_delay_ms: std::sync::atomic::AtomicU64,
+    searches: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+}
+
+impl FakeRadioBrowser {
+    fn new(stations: Vec<radiobrowser::RbStation>) -> Self {
+        Self {
+            stations,
+            down: std::sync::atomic::AtomicBool::new(false),
+            by_uuid_calls: std::sync::atomic::AtomicUsize::new(0),
+            answer_wrong_station: std::sync::atomic::AtomicBool::new(false),
+            by_uuid_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            searches: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_down(&self, down: bool) {
+        self.down.store(down, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_down(&self) -> bool {
+        self.down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_answer_wrong_station(&self, wrong: bool) {
+        self.answer_wrong_station.store(wrong, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn set_by_uuid_delay_ms(&self, delay_ms: u64) {
+        self.by_uuid_delay_ms.store(delay_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn by_uuid_call_count(&self) -> usize {
+        self.by_uuid_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl radiobrowser::RadioBrowser for FakeRadioBrowser {
+    async fn search(
+        &self,
+        name: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<Vec<radiobrowser::RbStation>, radiobrowser::RbError> {
+        self.searches
+            .lock()
+            .unwrap()
+            .push((name.map(str::to_string), tag.map(str::to_string)));
+        if self.is_down() {
+            return Err(radiobrowser::RbError::Unavailable("fake outage".to_string()));
+        }
+        Ok(self.stations.clone())
+    }
+
+    async fn by_uuid(&self, uuid: &str) -> Result<Option<radiobrowser::RbStation>, radiobrowser::RbError> {
+        self.by_uuid_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay_ms = self.by_uuid_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        if self.is_down() {
+            return Err(radiobrowser::RbError::Unavailable("fake outage".to_string()));
+        }
+        if self.answer_wrong_station.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(self.stations.first().cloned());
+        }
+        Ok(self.stations.iter().find(|station| station.uuid == uuid).cloned())
+    }
+}
+
+/// UUID of the first fake station.
+const JAZZ_UUID: &str = "11111111-1111-1111-1111-111111111111";
+/// UUID of the second fake station.
+const BLUES_UUID: &str = "22222222-2222-2222-2222-222222222222";
+
+fn fake_stations() -> Vec<radiobrowser::RbStation> {
+    vec![
+        radiobrowser::RbStation {
+            uuid: JAZZ_UUID.to_string(),
+            name: "Smooth Jazz Radio".to_string(),
+            genre: "jazz".to_string(),
+            country: "Canada".to_string(),
+            bitrate: 128,
+            url: "http://jazz.example.com/stream".to_string(),
+        },
+        radiobrowser::RbStation {
+            uuid: BLUES_UUID.to_string(),
+            name: "Blues Highway".to_string(),
+            genre: "blues".to_string(),
+            country: "USA".to_string(),
+            bitrate: 64,
+            url: "https://blues.example.com/live".to_string(),
+        },
+    ]
 }
 
 // Helper to create test app
@@ -405,6 +521,20 @@ async fn build_app(
     policy_timing: api::PolicyTiming,
     grab_zones: Option<Arc<Mutex<HashMap<String, yxc::ZoneStatus>>>>,
 ) -> TestApp {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut app = build_app_in(cache_dir.path(), yxc, policy_timing, grab_zones).await;
+    app._cache_dir = Some(cache_dir);
+    app
+}
+
+/// Like `build_app`, but on a caller-owned cache dir, so a test can start a
+/// second app on the same `my-stations.json` (a restart).
+async fn build_app_in(
+    test_dir: &std::path::Path,
+    yxc: Arc<dyn yxc::YxcClient>,
+    policy_timing: api::PolicyTiming,
+    grab_zones: Option<Arc<Mutex<HashMap<String, yxc::ZoneStatus>>>>,
+) -> TestApp {
     let config = config::Config::with_receiver_url("http://192.0.2.10");
     let events: Events = Arc::default();
     let player_mock = Arc::new(MockPlayer::new(events.clone()));
@@ -414,14 +544,7 @@ async fn build_app(
         ..MockAudioRoute::new(events.clone())
     });
 
-    // Create a minimal stations manager with unique temp directory
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-
-    let test_dir = std::env::temp_dir().join(format!("radio_test_{}", id));
-    std::fs::create_dir_all(&test_dir).unwrap();
-
+    // Create a minimal stations manager in the given cache dir
     let stations_file = test_dir.join("stations.toml");
     std::fs::write(
         &stations_file,
@@ -430,7 +553,7 @@ async fn build_app(
     .unwrap();
 
     let stations = Arc::new(RwLock::new(
-        stations::StationManager::new(&stations_file, &test_dir, "http://localhost".to_string())
+        stations::StationManager::new(&stations_file, test_dir, "http://localhost".to_string())
             .await
             .unwrap(),
     ));
@@ -445,6 +568,7 @@ async fn build_app(
     // Manually trigger a refresh so tests don't have to wait
     state_manager.refresh().await;
 
+    let radio_browser = Arc::new(FakeRadioBrowser::new(fake_stations()));
     let app_state = api::AppState {
         yxc,
         player,
@@ -454,6 +578,8 @@ async fn build_app(
         play_mutex: Arc::new(Mutex::new(())),
         policy_timing,
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        command_seq: Arc::default(),
+        completed_command_seq: Arc::default(),
         route: route_mock.clone(),
         route_tracking: Arc::default(),
         policy_completions: Arc::default(),
@@ -462,6 +588,8 @@ async fn build_app(
             player_mock.clone() as Arc<dyn cliamp::Player>,
             vis::VisConfig::default(),
         ),
+        radio_browser: radio_browser.clone(),
+        stations_tx: tokio::sync::broadcast::channel(16).0,
     };
 
     TestApp {
@@ -470,6 +598,8 @@ async fn build_app(
         route: route_mock,
         player: player_mock,
         events,
+        radio_browser,
+        _cache_dir: None,
     }
 }
 
@@ -618,6 +748,7 @@ async fn test_power_on_already_on_no_volume_change() {
         override_volume_once: Arc::default(),
         fail_set_power_for: None,
         fail_status_for: None,
+        play_info_delay_ms: Arc::default(),
     };
 
     let yxc = Arc::new(yxc_mock) as Arc<dyn yxc::YxcClient>;
@@ -2228,4 +2359,497 @@ async fn test_power_and_stop_wait_for_the_play_mutex() {
 
     assert_eq!(count_calls(&calls, "set_power main false"), 1);
     assert_eq!(count_events(&app.events, "player.stop"), 1);
+}
+
+// ---- Station discovery: search ----
+
+async fn discovery_app() -> TestApp {
+    build_app(Arc::new(MockYxcClient::new()), fast_timing(), None).await
+}
+
+#[tokio::test]
+async fn search_by_name_returns_ids_only_results() {
+    let app = discovery_app().await;
+
+    let response = app.server.get("/api/search").add_query_param("q", "jazz").await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["id"], format!("rb-{JAZZ_UUID}"));
+    assert_eq!(results[0]["name"], "Smooth Jazz Radio");
+    assert_eq!(results[0]["genre"], "jazz");
+    assert_eq!(results[0]["country"], "Canada");
+    assert_eq!(results[0]["bitrate"], 128);
+    assert_eq!(results[0]["in_my"], false);
+    // The stream URL never leaves the server.
+    assert!(!body.to_string().contains("example.com"));
+}
+
+#[tokio::test]
+async fn search_maps_the_genre_chip_to_a_radio_browser_tag() {
+    let app = discovery_app().await;
+
+    app.server
+        .get("/api/search")
+        .add_query_param("genre", "Alt")
+        .await
+        .assert_status_ok();
+    app.server
+        .get("/api/search")
+        .add_query_param("q", "  radio  ")
+        .add_query_param("genre", "Classic Rock")
+        .await
+        .assert_status_ok();
+
+    let searches = app.radio_browser.searches.lock().unwrap().clone();
+    assert_eq!(
+        searches,
+        vec![
+            (None, Some("alternative".to_string())),
+            (Some("radio".to_string()), Some("classic rock".to_string())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn search_rejects_bad_queries() {
+    let app = discovery_app().await;
+
+    for query in [
+        vec![],
+        vec![("q", "a")],
+        vec![("q", "   ")],
+        vec![("genre", "Polka")],
+        vec![("q", "jazz"), ("genre", "Polka")],
+    ] {
+        let mut request = app.server.get("/api/search");
+        for (key, value) in query {
+            request = request.add_query_param(key, value);
+        }
+        let response = request.await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"], "bad_query");
+    }
+    assert!(app.radio_browser.searches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_reports_unavailable_when_radio_browser_is_down() {
+    let app = discovery_app().await;
+    app.radio_browser.set_down(true);
+
+    let response = app.server.get("/api/search").add_query_param("q", "jazz").await;
+
+    response.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"], "search_unavailable");
+}
+
+#[tokio::test]
+async fn stations_view_has_an_empty_my_group_and_in_my_flags() {
+    let app = discovery_app().await;
+
+    let response = app.server.get("/api/stations").await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    let groups = body["groups"].as_array().unwrap();
+    let my = groups.iter().find(|group| group["id"] == "my").unwrap();
+    assert_eq!(my["label"], "MY");
+    assert_eq!(my["stations"].as_array().unwrap().len(), 0);
+    let first_curated = &groups[0]["stations"][0];
+    assert_eq!(first_curated["id"], "test");
+    assert_eq!(first_curated["in_my"], false);
+}
+
+// ---- Station discovery: the MY list ----
+
+/// The ids in the `my` group of a `Stations` body, in order.
+fn my_ids(stations_body: &serde_json::Value) -> Vec<String> {
+    let groups = stations_body["groups"].as_array().unwrap();
+    let my = groups.iter().find(|group| group["id"] == "my").unwrap();
+    my["stations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|station| station["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn my_add_and_remove_a_curated_station() {
+    let app = discovery_app().await;
+
+    let added = app.server.post("/api/my").json(&json!({"station": "test"})).await;
+    added.assert_status_ok();
+    let added_body: serde_json::Value = added.json();
+    assert_eq!(my_ids(&added_body), vec!["test"]);
+    assert_eq!(added_body["groups"][0]["stations"][0]["in_my"], true);
+
+    // Adding again is a no-op.
+    let again: serde_json::Value = app.server.post("/api/my").json(&json!({"station": "test"})).await.json();
+    assert_eq!(my_ids(&again), vec!["test"]);
+
+    let removed = app.server.delete("/api/my/test").await;
+    removed.assert_status_ok();
+    assert!(my_ids(&removed.json::<serde_json::Value>()).is_empty());
+
+    // Removing again is a no-op, not an error.
+    app.server.delete("/api/my/test").await.assert_status_ok();
+}
+
+#[tokio::test]
+async fn my_add_a_search_result_by_id() {
+    let app = discovery_app().await;
+    app.server.get("/api/search").add_query_param("q", "jazz").await.assert_status_ok();
+    let jazz_id = format!("rb-{JAZZ_UUID}");
+
+    let added = app.server.post("/api/my").json(&json!({"station": jazz_id})).await;
+    added.assert_status_ok();
+    let body: serde_json::Value = added.json();
+
+    assert_eq!(my_ids(&body), vec![jazz_id.clone()]);
+    let saved = &body["groups"].as_array().unwrap().iter().find(|group| group["id"] == "my").unwrap()["stations"][0];
+    assert_eq!(saved["name"], "Smooth Jazz Radio");
+    assert_eq!(saved["in_my"], true);
+    assert!(!body.to_string().contains("example.com"));
+
+    let search: serde_json::Value = app.server.get("/api/search").add_query_param("q", "jazz").await.json();
+    assert_eq!(search["results"][0]["in_my"], true);
+    assert_eq!(search["results"][1]["in_my"], false);
+}
+
+#[tokio::test]
+async fn my_add_rejects_unknown_and_malformed_ids() {
+    let app = discovery_app().await;
+
+    let unknown = app.server.post("/api/my").json(&json!({"station": "nonexistent"})).await;
+    unknown.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(unknown.json::<serde_json::Value>()["error"], "unknown_station");
+
+    let malformed = app.server.post("/api/my").json(&json!({"station": "rb-not-a-uuid"})).await;
+    malformed.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(malformed.json::<serde_json::Value>()["error"], "bad_station");
+}
+
+#[tokio::test]
+async fn my_is_capped_at_fifty_stations() {
+    let app = discovery_app().await;
+    let mut stations = app.state.stations.write().await;
+    for number in 0..my_stations::MY_CAP {
+        let uuid = format!("00000000-0000-0000-0000-{number:012}");
+        let entry = my_stations::MyEntry::Rb(my_stations::StoredRbStation::from_rb(&radiobrowser::RbStation {
+            uuid,
+            name: format!("Filler {number}"),
+            genre: String::new(),
+            country: String::new(),
+            bitrate: 0,
+            url: "http://filler.example.com/stream".to_string(),
+        }));
+        stations.my_add(entry).await.unwrap();
+    }
+    drop(stations);
+
+    let response = app.server.post("/api/my").json(&json!({"station": "test"})).await;
+
+    response.assert_status(axum::http::StatusCode::CONFLICT);
+    assert_eq!(response.json::<serde_json::Value>()["error"], "my_full");
+}
+
+#[tokio::test]
+async fn my_survives_an_app_restart() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let first = build_app_in(cache_dir.path(), Arc::new(MockYxcClient::new()), fast_timing(), None).await;
+    first.server.get("/api/search").add_query_param("q", "jazz").await.assert_status_ok();
+    first.server.post("/api/my").json(&json!({"station": format!("rb-{JAZZ_UUID}")})).await.assert_status_ok();
+    first.server.post("/api/my").json(&json!({"station": "test"})).await.assert_status_ok();
+    drop(first);
+
+    let second = build_app_in(cache_dir.path(), Arc::new(MockYxcClient::new()), fast_timing(), None).await;
+    let body: serde_json::Value = second.server.get("/api/stations").await.json();
+
+    assert_eq!(my_ids(&body), vec![format!("rb-{JAZZ_UUID}"), "test".to_string()]);
+}
+
+#[tokio::test]
+async fn my_changes_are_pushed_as_a_stations_event() {
+    let app = discovery_app().await;
+    let state = app.state.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, api::create_router(state)).await.unwrap();
+    });
+    let mut events = reqwest::get(format!("http://{address}/api/events")).await.unwrap();
+    // The connection opens with a snapshot (MY still empty, so nothing is in_my).
+    let snapshot = read_sse_until(&mut events, "event: stations").await;
+    assert!(!snapshot.contains(r#""in_my":true"#), "{snapshot:?}");
+
+    reqwest::Client::new()
+        .post(format!("http://{address}/api/my"))
+        .json(&json!({"station": "test"}))
+        .send()
+        .await
+        .unwrap();
+
+    let received = read_sse_until(&mut events, r#""in_my":true"#).await;
+    assert!(received.contains(r#""id":"my""#), "{received:?}");
+}
+
+#[tokio::test]
+async fn every_sse_connection_starts_with_a_stations_snapshot() {
+    let app = discovery_app().await;
+    // A change made before any browser subscribes: only the snapshot can carry it.
+    app.server.post("/api/my").json(&json!({"station": "test"})).await.assert_status_ok();
+    let state = app.state.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, api::create_router(state)).await.unwrap();
+    });
+
+    let mut events = reqwest::get(format!("http://{address}/api/events")).await.unwrap();
+    let received = read_sse_until(&mut events, "event: stations").await;
+
+    assert!(received.contains(r#""id":"my""#), "{received:?}");
+    assert!(received.contains(r#""revision":"#), "{received:?}");
+    assert!(received.contains(r#""in_my":true"#), "{received:?}");
+}
+
+#[tokio::test]
+async fn the_stations_revision_rises_on_add_and_remove_over_http() {
+    let app = discovery_app().await;
+    let revision = |body: &serde_json::Value| body["revision"].as_u64().expect("revision is a number");
+    let initial = revision(&app.server.get("/api/stations").await.json());
+
+    let added: serde_json::Value = app.server.post("/api/my").json(&json!({"station": "test"})).await.json();
+    assert!(revision(&added) > initial);
+    let repeated: serde_json::Value = app.server.post("/api/my").json(&json!({"station": "test"})).await.json();
+    assert_eq!(revision(&repeated), revision(&added));
+    let removed: serde_json::Value = app.server.delete("/api/my/test").await.json();
+    assert!(revision(&removed) > revision(&added));
+    let fetched: serde_json::Value = app.server.get("/api/stations").await.json();
+    assert_eq!(revision(&fetched), revision(&removed));
+}
+
+// ---- Station discovery: playing rb- ids ----
+
+#[tokio::test]
+async fn play_resolves_an_unsaved_station_with_by_uuid_then_the_cache() {
+    let app = discovery_app().await;
+    let jazz_id = format!("rb-{JAZZ_UUID}");
+
+    let first = app.server.post("/api/play").json(&json!({"station": jazz_id})).await;
+    first.assert_status_ok();
+    assert_eq!(app.radio_browser.by_uuid_call_count(), 1);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("http://jazz.example.com/stream"));
+    let state: serde_json::Value = first.json();
+    assert_eq!(state["player"]["station_name"], "Smooth Jazz Radio");
+
+    // The result is now cached: playing it again does not ask Radio Browser.
+    app.server.post("/api/play").json(&json!({"station": jazz_id})).await.assert_status_ok();
+    assert_eq!(app.radio_browser.by_uuid_call_count(), 1);
+}
+
+#[tokio::test]
+async fn play_uses_the_search_cache_when_radio_browser_goes_down() {
+    let app = discovery_app().await;
+    app.server.get("/api/search").add_query_param("q", "blues").await.assert_status_ok();
+    app.radio_browser.set_down(true);
+
+    let response = app.server.post("/api/play").json(&json!({"station": format!("rb-{BLUES_UUID}")})).await;
+
+    response.assert_status_ok();
+    assert_eq!(app.radio_browser.by_uuid_call_count(), 0);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("https://blues.example.com/live"));
+}
+
+#[tokio::test]
+async fn play_uses_my_after_a_restart_without_asking_radio_browser() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let first = build_app_in(cache_dir.path(), Arc::new(MockYxcClient::new()), fast_timing(), None).await;
+    first.server.get("/api/search").add_query_param("q", "jazz").await.assert_status_ok();
+    let jazz_id = format!("rb-{JAZZ_UUID}");
+    first.server.post("/api/my").json(&json!({"station": jazz_id})).await.assert_status_ok();
+    drop(first);
+
+    let second = build_app_in(cache_dir.path(), Arc::new(MockYxcClient::new()), fast_timing(), None).await;
+    second.radio_browser.set_down(true);
+    let response = second.server.post("/api/play").json(&json!({"station": jazz_id})).await;
+
+    response.assert_status_ok();
+    assert_eq!(second.radio_browser.by_uuid_call_count(), 0);
+    let player_state = cliamp::Player::state(second.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("http://jazz.example.com/stream"));
+}
+
+#[tokio::test]
+async fn play_rejects_ids_that_are_not_known_stations() {
+    let app = discovery_app().await;
+
+    // A URL in the station field is just an unknown id.
+    let url_as_id = app
+        .server
+        .post("/api/play")
+        .json(&json!({"station": "http://evil.example.com/stream"}))
+        .await;
+    url_as_id.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(url_as_id.json::<serde_json::Value>()["error"], "unknown_station");
+
+    // A URL smuggled in an extra field is ignored: the id still decides.
+    let extra_field = app
+        .server
+        .post("/api/play")
+        .json(&json!({"station": "nonexistent", "url": "http://evil.example.com/stream"}))
+        .await;
+    extra_field.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // A malformed rb- id never reaches Radio Browser.
+    let malformed = app.server.post("/api/play").json(&json!({"station": "rb-../../etc"})).await;
+    malformed.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(malformed.json::<serde_json::Value>()["error"], "bad_station");
+
+    // A well-formed rb- id that Radio Browser does not know.
+    let missing = app
+        .server
+        .post("/api/play")
+        .json(&json!({"station": "rb-99999999-9999-9999-9999-999999999999"}))
+        .await;
+    missing.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(missing.json::<serde_json::Value>()["error"], "unknown_station");
+
+    assert_eq!(app.radio_browser.by_uuid_call_count(), 1);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url, None);
+}
+
+#[tokio::test]
+async fn a_slow_receiver_poll_does_not_block_station_writers() {
+    let mock = MockYxcClient::new();
+    let delay_ms = mock.play_info_delay_ms.clone();
+    let app = build_app(Arc::new(mock), fast_timing(), None).await;
+    delay_ms.store(600, std::sync::atomic::Ordering::SeqCst);
+
+    let state_manager = app.state.state_manager.clone();
+    let refresh = tokio::spawn(async move { state_manager.refresh().await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let writer = tokio::time::timeout(std::time::Duration::from_millis(200), app.state.stations.write()).await;
+    assert!(writer.is_ok(), "refresh held the stations lock across the receiver calls");
+    drop(writer);
+    refresh.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lookup_that_answers_with_another_station_is_unknown_and_never_cached() {
+    let app = discovery_app().await;
+    app.radio_browser.set_answer_wrong_station(true);
+    let blues_id = format!("rb-{BLUES_UUID}");
+
+    let played = app.server.post("/api/play").json(&json!({"station": blues_id})).await;
+    played.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(played.json::<serde_json::Value>()["error"], "unknown_station");
+
+    let kept = app.server.post("/api/my").json(&json!({"station": blues_id})).await;
+    kept.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(kept.json::<serde_json::Value>()["error"], "unknown_station");
+
+    let stations = app.state.stations.read().await;
+    assert!(stations.cached_search_result(&blues_id).is_none());
+    assert!(stations.cached_search_result(&format!("rb-{JAZZ_UUID}")).is_none());
+    drop(stations);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url, None);
+    let body: serde_json::Value = app.server.get("/api/stations").await.json();
+    assert_eq!(my_ids(&body), Vec::<String>::new());
+}
+
+// ---- Command ordering: the most recently arrived play/stop/power wins ----
+
+#[tokio::test]
+async fn a_slow_rb_play_cannot_undo_a_stop_that_arrived_after_it() {
+    let app = discovery_app().await;
+    app.radio_browser.set_by_uuid_delay_ms(300);
+    let slow_play = app.server.post("/api/play").json(&json!({"station": format!("rb-{JAZZ_UUID}")}));
+    let stop_later = async {
+        tokio::time::sleep(ms(80)).await;
+        app.server.post("/api/stop").await
+    };
+
+    let (play_response, stop_response) = tokio::join!(std::future::IntoFuture::into_future(slow_play), stop_later);
+
+    stop_response.assert_status_ok();
+    play_response.assert_status_ok();
+    assert_eq!(play_response.json::<serde_json::Value>()["player"]["state"], "stopped");
+    assert_eq!(count_events(&app.events, "player.play"), 0);
+    assert_eq!(cliamp::Player::state(app.player.as_ref()).await.state, "stopped");
+}
+
+#[tokio::test]
+async fn a_slow_rb_play_cannot_undo_a_newer_play() {
+    let app = discovery_app().await;
+    app.radio_browser.set_by_uuid_delay_ms(300);
+    let slow_play = app.server.post("/api/play").json(&json!({"station": format!("rb-{JAZZ_UUID}")}));
+    let newer_play = async {
+        tokio::time::sleep(ms(80)).await;
+        app.server.post("/api/play").json(&json!({"station": "test"})).await
+    };
+
+    let (slow_response, newer_response) = tokio::join!(std::future::IntoFuture::into_future(slow_play), newer_play);
+
+    newer_response.assert_status_ok();
+    slow_response.assert_status_ok();
+    assert_eq!(count_events(&app.events, "player.play"), 1);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("https://test.example.com/stream"));
+}
+
+#[tokio::test]
+async fn a_slow_rb_play_cannot_undo_a_master_power_off() {
+    let app = discovery_app().await;
+    app.radio_browser.set_by_uuid_delay_ms(300);
+    let slow_play = app.server.post("/api/play").json(&json!({"station": format!("rb-{JAZZ_UUID}")}));
+    let power_off = async {
+        tokio::time::sleep(ms(80)).await;
+        app.server.post("/api/power").json(&json!({"on": false})).await
+    };
+
+    let (_play_response, power_response) = tokio::join!(std::future::IntoFuture::into_future(slow_play), power_off);
+
+    power_response.assert_status_ok();
+    assert_eq!(count_events(&app.events, "player.play"), 0);
+    assert_eq!(cliamp::Player::state(app.player.as_ref()).await.state, "stopped");
+}
+
+#[tokio::test]
+async fn two_quick_plays_still_play_the_second_one() {
+    let app = discovery_app().await;
+    // Both ids resolve from memory (curated, search cache), so neither is slow.
+    app.server.get("/api/search").add_query_param("q", "blues").await.assert_status_ok();
+    let first = app.server.post("/api/play").json(&json!({"station": "test"}));
+    let second = app.server.post("/api/play").json(&json!({"station": format!("rb-{BLUES_UUID}")}));
+
+    let (first_response, second_response) = tokio::join!(std::future::IntoFuture::into_future(first), std::future::IntoFuture::into_future(second));
+
+    first_response.assert_status_ok();
+    second_response.assert_status_ok();
+    assert_eq!(count_events(&app.events, "player.play"), 2);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("https://blues.example.com/live"));
+}
+
+#[tokio::test]
+async fn play_reports_unavailable_when_an_unsaved_station_cannot_be_looked_up() {
+    let app = discovery_app().await;
+    app.radio_browser.set_down(true);
+
+    let response = app.server.post("/api/play").json(&json!({"station": format!("rb-{JAZZ_UUID}")})).await;
+
+    response.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.json::<serde_json::Value>()["error"], "search_unavailable");
 }

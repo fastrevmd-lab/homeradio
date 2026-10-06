@@ -3,20 +3,22 @@
 use crate::cliamp::Player;
 use crate::config::Config;
 use crate::policy::{self, ZoneSelection, ZoneSnapshot};
+use crate::my_stations::{MyEntry, MyError, StoredRbStation, MY_CAP};
+use crate::radiobrowser::{self, RadioBrowser, RbStation};
 use crate::route::AudioRoute;
 use crate::state::{State, StateManager, ZoneLive, ZoneOverride};
-use crate::stations::StationManager;
+use crate::stations::{RegistryView, StationManager};
 use crate::vis::VisHub;
 use crate::volume;
 use crate::yxc::{YxcClient, YxcError};
 use axum::{
-    extract::{Path, State as AxumState},
+    extract::{Path, Query, State as AxumState},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -25,11 +27,11 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
-use tokio_stream::wrappers::{ReceiverStream, WatchStream};
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, WatchStream};
 use tokio_stream::{Stream, StreamExt};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Timing of the post-play zone policy. Production uses `Default`; tests shrink
 /// it so the background task finishes in milliseconds.
@@ -104,6 +106,12 @@ pub struct AppState {
     /// Bumped on every play, stop and power call. A background policy task exits
     /// as soon as the value it started with is no longer current.
     pub generation: Arc<AtomicU64>,
+    /// Arrival order of play, stop and master-power requests: each takes the next
+    /// number before doing any slow work (an `rb-` lookup can take seconds).
+    pub command_seq: Arc<AtomicU64>,
+    /// The highest `command_seq` whose command has taken effect. A play numbered
+    /// below it was overtaken by a newer command and must not start.
+    pub completed_command_seq: Arc<AtomicU64>,
     /// The AirPlay sink: connected on play, disconnected on stop.
     pub route: Arc<dyn AudioRoute>,
     pub route_tracking: Arc<StdMutex<RouteTracking>>,
@@ -112,6 +120,30 @@ pub struct AppState {
     pub policy_completions: Arc<AtomicU64>,
     /// Shared spectrum feed behind `GET /api/vis`.
     pub vis: Arc<VisHub>,
+    /// Radio Browser, behind a trait so tests can substitute a fake.
+    pub radio_browser: Arc<dyn RadioBrowser>,
+    /// Carries the `Stations` JSON to every SSE client after MY changes.
+    pub stations_tx: broadcast::Sender<String>,
+}
+
+impl AppState {
+    /// Numbers a play, stop or master-power request by arrival.
+    fn next_command_seq(&self) -> u64 {
+        self.command_seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Records that command `seq` has taken effect.
+    fn complete_command(&self, seq: u64) {
+        self.completed_command_seq.fetch_max(seq, Ordering::SeqCst);
+    }
+
+    /// True when a command that arrived after `seq` has already taken effect.
+    /// Comparing arrival numbers (not "did anything change since I started")
+    /// keeps two quick plays working: the older one finishing first is not a
+    /// reason to drop the newer one.
+    fn is_superseded(&self, seq: u64) -> bool {
+        self.completed_command_seq.load(Ordering::SeqCst) > seq
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +198,9 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/api/state", get(get_state))
         .route("/api/stations", get(get_stations))
+        .route("/api/search", get(search_stations))
+        .route("/api/my", post(add_my_station))
+        .route("/api/my/{id}", delete(remove_my_station))
         .route("/api/play", post(play_station))
         .route("/api/stop", post(stop_player))
         .route("/api/power", post(set_master_power))
@@ -182,26 +217,247 @@ async fn get_state(AxumState(state): AxumState<AppState>) -> Json<State> {
     Json(state.state_manager.get_state().await)
 }
 
-async fn get_stations(
-    AxumState(state): AxumState<AppState>,
-) -> Json<crate::stations::StationRegistry> {
+async fn get_stations(AxumState(state): AxumState<AppState>) -> Json<RegistryView> {
     let stations = state.stations.read().await;
-    Json(stations.get_registry())
+    Json(stations.registry_view())
+}
+
+/// Shortest `q` that searches by name.
+const SEARCH_MIN_QUERY_CHARS: usize = 2;
+/// `q` is cut to this many characters before it is sent on.
+const SEARCH_MAX_QUERY_CHARS: usize = 80;
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+    genre: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResult {
+    id: String,
+    name: String,
+    genre: String,
+    country: String,
+    bitrate: u32,
+    in_my: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    results: Vec<SearchResult>,
+}
+
+fn bad_query(detail: &str) -> Response {
+    error_response(StatusCode::BAD_REQUEST, "bad_query", detail)
+}
+
+fn search_unavailable() -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "search_unavailable",
+        "Station search is unavailable right now",
+    )
+}
+
+/// A station id after the server has looked up where to find its stream.
+enum ResolvedStation {
+    /// ROCK, CLIAMP or a saved MY station: the URL is already known.
+    Known { url: String },
+    /// An unsaved Radio Browser station, from the search cache or `by_uuid`.
+    Discovered(RbStation),
+}
+
+/// Resolves a client-supplied station id to a stream URL held by the server.
+/// The id is the only thing the client controls; it never supplies a URL.
+async fn resolve_station(state: &AppState, id: &str) -> Result<ResolvedStation, Response> {
+    {
+        let stations = state.stations.read().await;
+        if let Some(url) = stations.get_station_url(id) {
+            return Ok(ResolvedStation::Known { url: url.to_string() });
+        }
+        if let Some(found) = stations.cached_search_result(id) {
+            return Ok(ResolvedStation::Discovered(found));
+        }
+    }
+    let unknown = || error_response(StatusCode::BAD_REQUEST, "unknown_station", "Station not found");
+    if !id.starts_with("rb-") {
+        return Err(unknown());
+    }
+    let uuid = radiobrowser::rb_uuid(id).ok_or_else(|| {
+        error_response(StatusCode::BAD_REQUEST, "bad_station", "Malformed station id")
+    })?;
+    let found = state
+        .radio_browser
+        .by_uuid(uuid)
+        .await
+        .map_err(|e| {
+            warn!("Radio Browser lookup failed: {}", e);
+            search_unavailable()
+        })?
+        .ok_or_else(unknown)?;
+    // Never trust the answer to be the station that was asked for.
+    if found.id() != id {
+        warn!("Radio Browser answered {} for a lookup of {}", found.id(), id);
+        return Err(unknown());
+    }
+    state
+        .stations
+        .write()
+        .await
+        .remember_search_results(std::slice::from_ref(&found));
+    Ok(ResolvedStation::Discovered(found))
+}
+
+#[derive(Debug, Deserialize)]
+struct MyRequest {
+    station: String,
+}
+
+fn my_error_response(error: MyError) -> Response {
+    match error {
+        MyError::Full => error_response(
+            StatusCode::CONFLICT,
+            "my_full",
+            &format!("MY holds at most {} stations", MY_CAP),
+        ),
+        MyError::Save(io_error) => {
+            error!("Could not save the MY list: {}", io_error);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "my_save_failed",
+                "Could not save the MY list",
+            )
+        }
+    }
+}
+
+/// Tells every open browser the MY list changed. Called with the stations lock
+/// still held so events cannot be reordered. Having no listener is not an error.
+fn publish_stations(state: &AppState, view: &RegistryView) {
+    if let Ok(json) = serde_json::to_string(view) {
+        let _ = state.stations_tx.send(json);
+    }
+}
+
+/// `POST /api/my`: keeps a station in MY. Adding one already there is a no-op.
+/// Only a curated id (stored as a reference) or a Radio Browser station the
+/// server itself looked up (stored with its URL) is ever added.
+async fn add_my_station(
+    AxumState(state): AxumState<AppState>,
+    Json(req): Json<MyRequest>,
+) -> Result<Json<RegistryView>, Response> {
+    let entry = match resolve_station(&state, &req.station).await? {
+        ResolvedStation::Known { .. } => {
+            let stations = state.stations.read().await;
+            if stations.is_in_my(&req.station) {
+                return Ok(Json(stations.registry_view()));
+            }
+            // A saved MY station can be removed between resolving and here;
+            // only a curated id may become a reference.
+            if !stations.is_curated(&req.station) {
+                return Err(error_response(StatusCode::BAD_REQUEST, "unknown_station", "Station not found"));
+            }
+            MyEntry::Ref { station_id: req.station.clone() }
+        }
+        ResolvedStation::Discovered(found) => MyEntry::Rb(StoredRbStation::from_rb(&found)),
+    };
+
+    let mut stations = state.stations.write().await;
+    let changed = stations.my_add(entry).await.map_err(my_error_response)?;
+    let view = stations.registry_view();
+    if changed {
+        publish_stations(&state, &view);
+    }
+    Ok(Json(view))
+}
+
+/// `DELETE /api/my/{id}`: drops a station from MY. Removing one that is not there is a no-op.
+async fn remove_my_station(
+    AxumState(state): AxumState<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<RegistryView>, Response> {
+    let mut stations = state.stations.write().await;
+    let changed = stations.my_remove(&id).await.map_err(my_error_response)?;
+    let view = stations.registry_view();
+    if changed {
+        publish_stations(&state, &view);
+    }
+    Ok(Json(view))
+}
+
+/// `GET /api/search?q=…&genre=…`: Radio Browser stations by name and/or genre
+/// chip. The results are remembered briefly so they can be played or kept by id.
+async fn search_stations(
+    AxumState(state): AxumState<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, Response> {
+    let name: Option<String> = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| text.chars().count() >= SEARCH_MIN_QUERY_CHARS)
+        .map(|text| text.chars().take(SEARCH_MAX_QUERY_CHARS).collect());
+    let tag = match query.genre.as_deref().filter(|label| !label.is_empty()) {
+        Some(label) => Some(
+            radiobrowser::genre_tag(label)
+                .ok_or_else(|| bad_query("genre must be one of the genre chips"))?,
+        ),
+        None => None,
+    };
+    if name.is_none() && tag.is_none() {
+        return Err(bad_query("search needs at least 2 characters or a genre"));
+    }
+
+    let found = state
+        .radio_browser
+        .search(name.as_deref(), tag.as_deref())
+        .await
+        .map_err(|e| {
+            warn!("Radio Browser search failed: {}", e);
+            search_unavailable()
+        })?;
+
+    // Write-lock only for the cache insert; `in_my` needs just a read lock.
+    state.stations.write().await.remember_search_results(&found);
+    let stations = state.stations.read().await;
+    let results = found
+        .iter()
+        .map(|station| SearchResult {
+            id: station.id(),
+            name: station.name.clone(),
+            genre: station.genre.clone(),
+            country: station.country.clone(),
+            bitrate: station.bitrate,
+            in_my: stations.is_in_my(&station.id()),
+        })
+        .collect();
+    Ok(Json(SearchResponse { results }))
 }
 
 async fn play_station(
     AxumState(state): AxumState<AppState>,
     Json(req): Json<PlayRequest>,
 ) -> Result<Json<State>, Response> {
+    // Number the request on arrival, before the (possibly slow) lookup below.
+    let command_seq = state.next_command_seq();
+    // Resolve the id first: a Radio Browser lookup can take seconds and must not
+    // hold up other plays. The client only ever supplies the id, never a URL.
+    let (station_url, discovered) = match resolve_station(&state, &req.station).await? {
+        ResolvedStation::Known { url } => (url, None),
+        ResolvedStation::Discovered(found) => (found.url.clone(), Some(found)),
+    };
+
     // Serialize play operations
     let _guard = state.play_mutex.lock().await;
 
-    let stations = state.stations.read().await;
-    let station_url = stations
-        .get_station_url(&req.station)
-        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "unknown_station", "Station not found"))?
-        .to_string();
-    drop(stations);
+    // A stop, power or newer play that arrived after this request and already ran
+    // wins; answer with the current state instead of starting a stale station.
+    if state.is_superseded(command_seq) {
+        info!("Play of {} superseded by a newer command", req.station);
+        state.state_manager.refresh().await;
+        return Ok(Json(state.state_manager.get_state().await));
+    }
 
     // Snapshot LIVE receiver state (the cache can be seconds old, and a
     // TV that just switched to hdmi1 must be seen as such).
@@ -225,6 +481,7 @@ async fn play_station(
     // The play is now committed: only here is the running policy task superseded,
     // so a rejected play (unknown station, no zone, receiver down) leaves it alone.
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.complete_command(command_seq);
 
     // Step 3: Bring the AirPlay sink up. This MUST come after the snapshot: the
     // receiver grabs both zones as soon as the sink connects.
@@ -248,6 +505,16 @@ async fn play_station(
     })?;
 
     state.state_manager.set_last_played_station(req.station.clone()).await;
+    {
+        // Only a station that is neither saved nor curated is "discovered"; the
+        // check is repeated here because MY can change after the lookup.
+        let mut stations = state.stations.write().await;
+        let playing_id = discovered.as_ref().map_or_else(|| req.station.clone(), |found| found.id());
+        let unsaved = discovered
+            .as_ref()
+            .filter(|found| !stations.is_in_my(&found.id()) && !stations.is_curated(&found.id()));
+        stations.note_playing(&playing_id, unsaved);
+    }
     {
         let mut tracking = state.route_tracking.lock().unwrap();
         tracking.selection = Some(selected.clone());
@@ -275,9 +542,11 @@ async fn play_station(
 }
 
 async fn stop_player(AxumState(state): AxumState<AppState>) -> Result<Json<State>, Response> {
+    let command_seq = state.next_command_seq();
     // Serialize with play and power calls: each reads, then bumps the generation.
     let _guard = state.play_mutex.lock().await;
     state.generation.fetch_add(1, Ordering::SeqCst);
+    state.complete_command(command_seq);
     state.player.stop().await.map_err(|e| {
         error!("Failed to stop player: {}", e);
         error_response(
@@ -313,8 +582,10 @@ async fn set_master_power(
 ) -> Result<Json<State>, Response> {
     // Serialize with play, stop and zone toggles, and supersede any running
     // policy task so it cannot undo the power change.
+    let command_seq = state.next_command_seq();
     let _guard = state.play_mutex.lock().await;
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.complete_command(command_seq);
 
     if !req.on {
         // Try every step even if one fails, so a hiccup on one part never leaves
@@ -599,13 +870,24 @@ async fn sse_handler(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.state_manager.subscribe();
 
-    let stream = WatchStream::new(rx).map(|state| {
+    let state_events = WatchStream::new(rx).map(|state| {
         Ok(Event::default()
             .event("state")
             .data(serde_json::to_string(&state).unwrap()))
     });
+    // Subscribe before taking the snapshot so no change falls between them. The
+    // snapshot is the first `stations` event of every connection: a change made
+    // after the page's GET /api/stations but before this subscription would
+    // otherwise be missed. A lagging receiver drops events; clients refetch
+    // /api/stations on reconnect, and ignore any snapshot older than the one
+    // they show (by `revision`).
+    let stations_rx = state.stations_tx.subscribe();
+    let snapshot = serde_json::to_string(&state.stations.read().await.registry_view()).unwrap();
+    let stations_events = tokio_stream::once(snapshot)
+        .chain(BroadcastStream::new(stations_rx).filter_map(|message| message.ok()))
+        .map(|json| Ok(Event::default().event("stations").data(json)));
 
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Sse::new(state_events.merge(stations_events)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 /// `GET /api/vis`: SSE stream of spectrum frames (`event: vis`).

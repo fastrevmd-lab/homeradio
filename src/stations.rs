@@ -1,3 +1,6 @@
+use crate::my_stations::{MyEntry, MyError, MyStore, StoredRbStation};
+use crate::radiobrowser::RbStation;
+use crate::search_cache::SearchCache;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,6 +30,72 @@ pub struct StationRegistry {
     pub groups: Vec<StationGroup>,
 }
 
+/// A station as `GET /api/stations` shows it: no URL, plus whether it is in MY.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StationView {
+    pub id: String,
+    pub name: String,
+    pub short: String,
+    pub genre: String,
+    pub in_my: bool,
+}
+
+impl StationView {
+    fn from_station(station: &Station, in_my: bool) -> Self {
+        Self {
+            id: station.id.clone(),
+            name: station.name.clone(),
+            short: station.short.clone(),
+            genre: station.genre.clone(),
+            in_my,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupView {
+    pub id: String,
+    pub label: String,
+    pub stations: Vec<StationView>,
+}
+
+/// The `Stations` API shape: the ROCK and CLIAMP groups plus the `my` group.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegistryView {
+    /// Identifies this server process: generated once at startup and different
+    /// on every boot. `revision` is only comparable within one `boot`, so a
+    /// client that sees a new `boot` accepts the snapshot whatever its revision
+    /// (the wall clock behind the revision seed can step back).
+    pub boot: String,
+    /// Rises on every MY or CLIAMP change, so a client can discard a snapshot
+    /// older than the one it already shows. Each boot seeds it from the wall
+    /// clock (milliseconds), so a page from a build that predates `boot` and
+    /// compares revisions alone is not left behind by a restart.
+    pub revision: u64,
+    pub groups: Vec<GroupView>,
+}
+
+/// Where a new manager's revision counter starts: milliseconds since the epoch.
+/// Pages from builds that predate `boot` compare revisions on this scale, so a
+/// restart must not drop below it; `boot` covers a clock that stepped back.
+fn initial_revision() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// A boot identifier that differs between processes and between managers in one
+/// process: startup time in nanoseconds, the process id and a per-process
+/// sequence number, in hex.
+fn new_boot_id() -> String {
+    static NEXT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let sequence = NEXT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos:x}-{:x}-{sequence:x}", std::process::id())
+}
+
 #[derive(Debug, Deserialize)]
 struct RockStationsFile {
     station: Vec<Station>,
@@ -53,6 +122,17 @@ pub struct StationManager {
     station_urls: HashMap<String, String>,
     cache_path: PathBuf,
     remote_url: String,
+    /// The household's MY list, `<cache_dir>/my-stations.json`.
+    my: MyStore,
+    /// Recent search results, so they can be played or kept by id.
+    search_cache: SearchCache,
+    /// The Radio Browser station that is playing now, kept so the LCD name
+    /// survives the search cache expiring (or the station leaving MY) mid-listen.
+    playing_rb: Option<StoredRbStation>,
+    /// Bumped on every change to what `registry_view` shows; see `RegistryView`.
+    revision: u64,
+    /// Generated once per manager; see `RegistryView`.
+    boot: String,
 }
 
 impl StationManager {
@@ -68,6 +148,7 @@ impl StationManager {
         tokio::fs::create_dir_all(cache_dir).await.ok();
 
         let cache_path = cache_dir.join("cliamp-stations.json");
+        let my = MyStore::load(cache_dir.join("my-stations.json"));
 
         // Load cliamp stations
         let cliamp_stations = Self::fetch_cliamp_stations(&remote_url, &cache_path).await;
@@ -78,6 +159,11 @@ impl StationManager {
             station_urls: HashMap::new(),
             cache_path,
             remote_url,
+            my,
+            search_cache: SearchCache::new(),
+            playing_rb: None,
+            revision: initial_revision(),
+            boot: new_boot_id(),
         };
 
         manager.rebuild_url_map();
@@ -188,16 +274,149 @@ impl StationManager {
         }
     }
 
+    /// The stream URL for a station id: ROCK/CLIAMP from the registry, then a
+    /// Radio Browser station saved in MY. Unsaved search results are resolved
+    /// by the API layer, never here.
     pub fn get_station_url(&self, id: &str) -> Option<&str> {
-        self.station_urls.get(id).map(|s| s.as_str())
+        if let Some(url) = self.station_urls.get(id) {
+            return Some(url.as_str());
+        }
+        self.my.get_rb(id).map(|station| station.url.as_str())
     }
 
+    /// The display name for a station id, from the registry, MY, the station
+    /// playing now, or the search cache.
     pub fn get_station_name(&self, id: &str) -> Option<String> {
-        self.rock_stations
+        let curated = self
+            .rock_stations
             .iter()
             .chain(self.cliamp_stations.iter())
-            .find(|s| s.id == id)
-            .map(|s| s.name.clone())
+            .find(|s| s.id == id);
+        if let Some(station) = curated {
+            return Some(station.name.clone());
+        }
+        if let Some(stored) = self.my.get_rb(id) {
+            return Some(stored.name.clone());
+        }
+        if let Some(playing) = self.playing_rb.as_ref().filter(|rb| rb.id == id) {
+            return Some(playing.name.clone());
+        }
+        self.search_cache.get(id, time::Instant::now()).map(|rb| rb.name)
+    }
+
+    /// The id of the station that streams `url`: curated stations first (ROCK
+    /// before CLIAMP), then MY, then the Radio Browser station playing now.
+    pub fn station_id_for_url(&self, url: &str) -> Option<String> {
+        let curated = self
+            .rock_stations
+            .iter()
+            .chain(self.cliamp_stations.iter())
+            .find(|s| self.station_urls.get(&s.id).map(String::as_str) == Some(url));
+        if let Some(station) = curated {
+            return Some(station.id.clone());
+        }
+        if let Some(stored) = self.my.rb_entries().find(|stored| stored.url == url) {
+            return Some(stored.id.clone());
+        }
+        self.playing_rb.as_ref().filter(|rb| rb.url == url).map(|rb| rb.id.clone())
+    }
+
+    /// True for a ROCK or CLIAMP station id.
+    pub fn is_curated(&self, id: &str) -> bool {
+        self.station_urls.contains_key(id)
+    }
+
+    /// True when `id` is in MY.
+    pub fn is_in_my(&self, id: &str) -> bool {
+        self.my.contains(id)
+    }
+
+    /// Adds an entry to MY; `Ok(false)` when it was already there.
+    pub async fn my_add(&mut self, entry: MyEntry) -> Result<bool, MyError> {
+        let changed = self.my.add(entry).await?;
+        if changed {
+            self.revision += 1;
+        }
+        Ok(changed)
+    }
+
+    /// Removes an entry from MY; `Ok(false)` when it was not there.
+    pub async fn my_remove(&mut self, id: &str) -> Result<bool, MyError> {
+        let changed = self.my.remove(id).await?;
+        if changed {
+            self.revision += 1;
+        }
+        Ok(changed)
+    }
+
+    /// Remembers search results so they can be played or kept by id.
+    pub fn remember_search_results(&mut self, stations: &[RbStation]) {
+        self.search_cache.insert_all(stations, time::Instant::now());
+    }
+
+    /// A recent search result by id, if it has not expired.
+    pub fn cached_search_result(&self, id: &str) -> Option<RbStation> {
+        self.search_cache.get(id, time::Instant::now())
+    }
+
+    /// Records what is playing now: the freshly discovered Radio Browser
+    /// station if there is one, else the MY entry with this id (if any), so
+    /// a ROCK/CLIAMP station clears the previous Radio Browser one.
+    pub fn note_playing(&mut self, id: &str, discovered: Option<&RbStation>) {
+        self.playing_rb = match discovered {
+            Some(station) => Some(StoredRbStation::from_rb(station)),
+            None => self.my.get_rb(id).cloned(),
+        };
+    }
+
+    /// The registry as the API shows it: ROCK and CLIAMP flagged with `in_my`,
+    /// plus the `my` group in insertion order. A reference whose station is
+    /// gone is left out (but stays in the file).
+    pub fn registry_view(&self) -> RegistryView {
+        let registry = self.get_registry();
+
+        let mut my_stations: Vec<StationView> = Vec::new();
+        for entry in self.my.entries() {
+            match entry {
+                MyEntry::Ref { station_id } => {
+                    let found = registry
+                        .groups
+                        .iter()
+                        .flat_map(|group| &group.stations)
+                        .find(|station| &station.id == station_id);
+                    if let Some(station) = found {
+                        my_stations.push(StationView::from_station(station, true));
+                    }
+                }
+                MyEntry::Rb(stored) => my_stations.push(StationView {
+                    id: stored.id.clone(),
+                    name: stored.name.clone(),
+                    short: stored.short.clone(),
+                    genre: stored.genre.clone(),
+                    in_my: true,
+                }),
+            }
+        }
+
+        let mut groups: Vec<GroupView> = registry
+            .groups
+            .iter()
+            .map(|group| GroupView {
+                id: group.id.clone(),
+                label: group.label.clone(),
+                stations: group
+                    .stations
+                    .iter()
+                    .map(|station| StationView::from_station(station, self.my.contains(&station.id)))
+                    .collect(),
+            })
+            .collect();
+        groups.push(GroupView {
+            id: "my".to_string(),
+            label: "MY".to_string(),
+            stations: my_stations,
+        });
+        RegistryView { boot: self.boot.clone(), revision: self.revision, groups }
     }
 
     /// Start background refresh task
@@ -219,6 +438,7 @@ impl StationManager {
                 let mut mgr = manager.write().await;
                 mgr.cliamp_stations = stations;
                 mgr.rebuild_url_map();
+                mgr.revision += 1;
             }
         });
     }
@@ -283,11 +503,240 @@ mod tests {
             station_urls: HashMap::new(),
             cache_path: PathBuf::new(),
             remote_url: String::new(),
+            my: MyStore::load(PathBuf::from("/nonexistent/my-stations.json")),
+            search_cache: SearchCache::new(),
+            playing_rb: None,
+            revision: 0,
+            boot: new_boot_id(),
         };
 
         manager.rebuild_url_map();
 
         // Rock takes precedence
         assert_eq!(manager.get_station_url("test"), Some("http://rock"));
+    }
+
+    const UUID_A: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn curated(id: &str, url: &str) -> Station {
+        Station {
+            id: id.to_string(),
+            name: format!("{id} name"),
+            short: id.to_string(),
+            genre: "Rock".to_string(),
+            url: url.to_string(),
+        }
+    }
+
+    fn rb_station(uuid: &str, url: &str) -> RbStation {
+        RbStation {
+            uuid: uuid.to_string(),
+            name: "Jazz FM".to_string(),
+            genre: "jazz".to_string(),
+            country: "France".to_string(),
+            bitrate: 128,
+            url: url.to_string(),
+        }
+    }
+
+    fn stored(station: &RbStation) -> MyEntry {
+        MyEntry::Rb(crate::my_stations::StoredRbStation::from_rb(station))
+    }
+
+    /// A manager with one ROCK (`big100`) and one CLIAMP (`lofi`) station and
+    /// an empty MY list stored in `dir`.
+    fn manager_in(dir: &Path) -> StationManager {
+        let mut manager = StationManager {
+            rock_stations: vec![curated("big100", "http://rock/big100")],
+            cliamp_stations: vec![curated("lofi", "http://cliamp/lofi")],
+            station_urls: HashMap::new(),
+            cache_path: PathBuf::new(),
+            remote_url: String::new(),
+            my: MyStore::load(dir.join("my-stations.json")),
+            search_cache: SearchCache::new(),
+            playing_rb: None,
+            revision: initial_revision(),
+            boot: new_boot_id(),
+        };
+        manager.rebuild_url_map();
+        manager
+    }
+
+    fn group<'a>(view: &'a RegistryView, id: &str) -> &'a GroupView {
+        view.groups.iter().find(|group| group.id == id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_view_adds_an_empty_my_group_and_in_my_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_in(dir.path());
+        let view = manager.registry_view();
+        let ids: Vec<&str> = view.groups.iter().map(|group| group.id.as_str()).collect();
+        assert_eq!(ids, vec!["rock", "cliamp", "my"]);
+        assert_eq!(group(&view, "my").label, "MY");
+        assert!(group(&view, "my").stations.is_empty());
+        assert!(!group(&view, "rock").stations[0].in_my);
+    }
+
+    #[tokio::test]
+    async fn the_revision_rises_on_every_real_my_change_and_only_then() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let initial = manager.registry_view().revision;
+
+        manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
+        let after_add = manager.registry_view().revision;
+        assert!(after_add > initial);
+
+        manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
+        assert_eq!(manager.registry_view().revision, after_add, "a no-op add changes nothing");
+
+        manager.my_remove("lofi").await.unwrap();
+        assert!(manager.registry_view().revision > after_add);
+
+        let json = serde_json::to_value(manager.registry_view()).unwrap();
+        assert!(json["revision"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn the_boot_id_is_present_and_stable_for_one_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let first = serde_json::to_value(manager.registry_view()).unwrap();
+        let boot = first["boot"].as_str().expect("boot is a string");
+        assert!(!boot.is_empty());
+
+        manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
+        let second = serde_json::to_value(manager.registry_view()).unwrap();
+        assert_eq!(second["boot"], first["boot"], "a MY change does not start a new boot");
+    }
+
+    #[tokio::test]
+    async fn a_restarted_manager_has_a_different_boot_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = manager_in(dir.path()).registry_view().boot;
+        let later = manager_in(dir.path()).registry_view().boot;
+        assert_ne!(earlier, later, "a client must be able to tell the restart apart");
+    }
+
+    #[tokio::test]
+    async fn a_new_manager_seeds_the_revision_from_the_wall_clock_in_milliseconds() {
+        // An already-open page from an older build compares revisions on this
+        // scale and has no `boot`, so a restarted server must not drop below it.
+        let dir = tempfile::tempdir().unwrap();
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let manager = StationManager::new(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("config/stations.toml"),
+            dir.path(),
+            "http://127.0.0.1:9/stations".to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(manager.registry_view().revision >= before_ms);
+    }
+
+    #[tokio::test]
+    async fn my_group_lists_refs_and_rb_stations_in_insertion_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let rb = rb_station(UUID_A, "https://jazz.example/stream");
+        manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
+        manager.my_add(stored(&rb)).await.unwrap();
+        manager.my_add(MyEntry::Ref { station_id: "big100".to_string() }).await.unwrap();
+
+        let view = manager.registry_view();
+        let my_ids: Vec<&str> = group(&view, "my").stations.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(my_ids, vec!["lofi", &format!("rb-{UUID_A}")[..], "big100"]);
+        assert!(group(&view, "my").stations.iter().all(|s| s.in_my));
+        assert!(group(&view, "rock").stations[0].in_my, "big100 is flagged in its own band");
+        assert!(group(&view, "cliamp").stations[0].in_my);
+
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("jazz.example"), "stream URLs never reach the API: {json}");
+    }
+
+    #[tokio::test]
+    async fn a_dangling_reference_is_hidden_and_reappears_with_its_station() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        manager.my_add(MyEntry::Ref { station_id: "gone".to_string() }).await.unwrap();
+        assert!(group(&manager.registry_view(), "my").stations.is_empty());
+
+        manager.cliamp_stations.push(curated("gone", "http://cliamp/gone"));
+        manager.rebuild_url_map();
+        let view = manager.registry_view();
+        assert_eq!(group(&view, "my").stations[0].id, "gone");
+    }
+
+    #[tokio::test]
+    async fn urls_resolve_for_curated_and_saved_stations_but_not_for_search_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let saved = rb_station(UUID_A, "https://jazz.example/stream");
+        let other = rb_station("22222222-2222-2222-2222-222222222222", "https://other.example/stream");
+        manager.my_add(stored(&saved)).await.unwrap();
+        manager.remember_search_results(std::slice::from_ref(&other));
+
+        assert_eq!(manager.get_station_url("big100"), Some("http://rock/big100"));
+        assert_eq!(manager.get_station_url(&saved.id()), Some("https://jazz.example/stream"));
+        assert_eq!(manager.get_station_url(&other.id()), None);
+        assert_eq!(manager.cached_search_result(&other.id()), Some(other));
+    }
+
+    #[tokio::test]
+    async fn names_come_from_the_registry_my_the_playing_station_or_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let saved = rb_station(UUID_A, "https://jazz.example/stream");
+        let playing = rb_station("22222222-2222-2222-2222-222222222222", "https://p.example/s");
+        let cached = rb_station("33333333-3333-3333-3333-333333333333", "https://c.example/s");
+        manager.my_add(stored(&saved)).await.unwrap();
+        manager.note_playing(&playing.id(), Some(&playing));
+        manager.remember_search_results(std::slice::from_ref(&cached));
+
+        assert_eq!(manager.get_station_name("big100").as_deref(), Some("big100 name"));
+        assert_eq!(manager.get_station_name(&saved.id()).as_deref(), Some("Jazz FM"));
+        assert_eq!(manager.get_station_name(&playing.id()).as_deref(), Some("Jazz FM"));
+        assert_eq!(manager.get_station_name(&cached.id()).as_deref(), Some("Jazz FM"));
+        assert_eq!(manager.get_station_name("rb-44444444-4444-4444-4444-444444444444"), None);
+
+        manager.note_playing("big100", None);
+        assert_eq!(manager.get_station_name(&playing.id()), None);
+
+        manager.note_playing(&saved.id(), None);
+        manager.my_remove(&saved.id()).await.unwrap();
+        assert_eq!(
+            manager.get_station_name(&saved.id()).as_deref(),
+            Some("Jazz FM"),
+            "a station removed from MY keeps its name while it plays"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playing_url_maps_back_to_its_station_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let saved = rb_station(UUID_A, "https://jazz.example/stream");
+        let playing = rb_station("22222222-2222-2222-2222-222222222222", "https://p.example/s");
+        manager.my_add(stored(&saved)).await.unwrap();
+        manager.note_playing(&playing.id(), Some(&playing));
+
+        assert_eq!(manager.station_id_for_url("http://cliamp/lofi").as_deref(), Some("lofi"));
+        assert_eq!(manager.station_id_for_url("http://rock/big100").as_deref(), Some("big100"));
+        assert_eq!(manager.station_id_for_url("https://jazz.example/stream"), Some(saved.id()));
+        assert_eq!(manager.station_id_for_url("https://p.example/s"), Some(playing.id()));
+        assert_eq!(manager.station_id_for_url("https://nowhere.example/"), None);
+    }
+
+    #[tokio::test]
+    async fn curated_ids_are_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_in(dir.path());
+        assert!(manager.is_curated("big100"));
+        assert!(manager.is_curated("lofi"));
+        assert!(!manager.is_curated(&format!("rb-{UUID_A}")));
     }
 }

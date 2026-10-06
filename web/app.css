@@ -496,6 +496,45 @@ body::before {
     display: flex;
     align-items: center;
     height: 100%;
+    min-width: 0;
+    margin-right: 30px; /* room for the star */
+    overflow: hidden;
+}
+
+/* The LCD's star: dim outline when the station is not in MY, lit when it is */
+.lcd-star {
+    position: absolute;
+    top: 50%;
+    right: 6px;
+    transform: translateY(-50%);
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: #052a28;
+    color: rgba(143, 245, 236, 0.55); /* >= 3:1 on the LCD green */
+    font-size: 17px;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 0.2s, text-shadow 0.2s;
+}
+
+.lcd-star[aria-pressed="true"] {
+    color: #8ff5ec;
+    text-shadow: 0 0 6px rgba(77, 208, 200, 0.7);
+}
+
+.lcd-star:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
+.lcd-star:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: -3px;
 }
 
 .lcd-text {
@@ -780,30 +819,36 @@ body::before {
     color: rgba(214, 252, 248, 0.7);
 }
 
+/* The empty MY band: a sentence, not a label */
+.dial-empty.dial-hint {
+    padding: 0 8px;
+    text-align: center;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+}
+
 /* Band switch */
 .band-switch-container {
     display: flex;
+    align-items: center;
     justify-content: center;
+    gap: 10px;
 }
 
 .band-switch {
     position: relative;
     display: inline-block;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 240px;
     cursor: pointer;
-}
-
-.band-switch input {
-    position: absolute;
-    opacity: 0;
-    width: 0;
-    height: 0;
 }
 
 .band-switch-slider {
     position: relative;
     display: flex;
     align-items: center;
-    width: 200px;
+    width: 100%;
     padding: 6px;
     border-radius: 999px;
     border: 1px solid var(--border);
@@ -814,8 +859,8 @@ body::before {
 .band-switch-slider::before {
     content: '';
     position: absolute;
-    left: 5px;
-    width: calc(50% - 5px);
+    left: 6px;
+    width: calc((100% - 12px) / 3);
     height: calc(100% - 10px);
     border-radius: 999px;
     background: linear-gradient(to bottom, var(--teal), var(--teal-deep));
@@ -823,15 +868,24 @@ body::before {
     transition: transform 0.3s;
 }
 
-.band-switch input:checked ~ .band-switch-slider::before {
-    transform: translateX(calc(100% + 0px));
+.band-switch[data-band="cliamp"] .band-switch-slider::before {
+    transform: translateX(100%);
 }
 
-.band-label-left,
-.band-label-right {
+.band-switch[data-band="my"] .band-switch-slider::before {
+    transform: translateX(200%);
+}
+
+/* One segment of the three-way switch (a radio button in a radiogroup) */
+.band-option {
     position: relative;
     z-index: 2;
     flex: 1;
+    padding: 2px 0;
+    border: 0;
+    border-radius: 999px;
+    background: none;
+    cursor: inherit;
     text-align: center;
     font-family: var(--mono);
     font-size: 11px;
@@ -841,9 +895,35 @@ body::before {
     transition: color 0.3s;
 }
 
-.band-switch input:not(:checked) ~ .band-switch-slider .band-label-left,
-.band-switch input:checked ~ .band-switch-slider .band-label-right {
+.band-option[aria-checked="true"] {
     color: var(--ink-0);
+}
+
+.band-option:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
+}
+
+/* Search button beside the band switch: a small round metal key */
+.search-btn {
+    flex: none;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid #323a47;
+    background: linear-gradient(to bottom, #2b313c, #1a1e27);
+    box-shadow: 0 2px 0 #07090d, inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.search-btn:hover { border-color: var(--teal-dim); }
+.search-btn:active { transform: translateY(1px); }
+.search-btn:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 3px;
 }
 
 /* Preset buttons: dark metal keys, teal-lit when selected */
@@ -869,6 +949,10 @@ body::before {
 
 .preset-btn {
     position: relative;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     padding: 12px 6px 10px;
     border-radius: 6px;
     font-size: 11px;
@@ -876,6 +960,13 @@ body::before {
     letter-spacing: 0.03em;
     line-height: 1.2;
     text-align: center;
+}
+
+/* A band with fewer than 7 stations leaves blank, dead keys */
+.preset-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+    pointer-events: none;
 }
 
 /* indicator slit on every key */
@@ -1095,7 +1186,7 @@ body::before {
     border-radius: 2px;
     background: linear-gradient(to bottom, #8ff5ec, var(--teal-deep));
     box-shadow: 0 0 6px rgba(77, 208, 200, 0.8);
-    transform: translateX(-50%) rotate(-135deg);
+    transform: translateX(-50%) rotate(90deg);
     transform-origin: 50% 27px;
 }
 
@@ -1152,7 +1243,7 @@ body::before {
 .zone-toggle:active .toggle-slider::after,
 .preset-btn:focus-visible::after,
 .transport-btn:focus-visible::after,
-.band-switch input:focus-visible ~ .band-switch-slider::after,
+.band-switch:has(.band-option:focus-visible) .band-switch-slider::after,
 .zone-toggle input:focus-visible ~ .toggle-slider::after {
     opacity: 1;
 }
@@ -1199,7 +1290,6 @@ body::before {
     outline-offset: 3px;
 }
 
-.band-switch input:focus-visible ~ .band-switch-slider,
 .zone-toggle input:focus-visible ~ .toggle-slider {
     outline: 3px solid var(--focus);
     outline-offset: 3px;
@@ -1284,4 +1374,223 @@ body::before {
     .preset-buttons { grid-template-columns: repeat(7, 1fr); }
     .volume-knob { width: 76px; height: 76px; }
     .knob-indicator { height: 26px; transform-origin: 50% 29px; }
+}
+
+/* Search drawer. It sits at body level, outside .control-panel (which has its own
+   stacking context), so it can cover the whole boom box. */
+.search-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: rgba(0, 0, 0, 0.55);
+}
+
+.search-drawer {
+    position: fixed;
+    z-index: 41;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 16px 16px;
+    color: var(--text-1);
+    border: 1px solid var(--border);
+    background: linear-gradient(to bottom, #1a1e27, #12151c);
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.6);
+    /* phones: a bottom sheet */
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-height: 80vh; /* fallback for browsers without dvh */
+    max-height: 80dvh;
+    border-radius: 14px 14px 0 0;
+}
+
+/* display: flex above would beat the hidden attribute */
+.search-drawer[hidden],
+.search-backdrop[hidden] {
+    display: none;
+}
+
+.search-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.search-title {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--teal);
+}
+
+.search-close {
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--ink-0);
+    color: var(--text-2);
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.search-close:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
+}
+
+.search-input {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--ink-0);
+    color: var(--text-1);
+    font-family: var(--sans);
+    font-size: 16px; /* 16px stops iOS zooming the page on focus */
+}
+
+.search-input:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .search-drawer { animation: drawer-up 0.22s ease-out; }
+}
+
+@keyframes drawer-up {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+}
+
+@keyframes drawer-in {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+}
+
+.search-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.search-chip {
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--ink-0);
+    color: var(--text-2);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+}
+
+.search-chip[aria-pressed="true"] {
+    border-color: var(--teal);
+    background: linear-gradient(to bottom, #6fe6df, var(--teal-deep));
+    color: var(--ink-0);
+}
+
+.search-chip:focus-visible,
+.search-play:focus-visible,
+.search-star:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
+}
+
+.search-status {
+    min-height: 1.4em;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-3);
+}
+
+.search-results {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    list-style: none;
+}
+
+.search-row {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--ink-1);
+}
+
+.search-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.search-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.search-meta {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-3);
+}
+
+.search-play,
+.search-star {
+    flex: none;
+    width: 40px;
+    height: 40px;
+    border: 1px solid #323a47;
+    border-radius: 50%;
+    background: linear-gradient(to bottom, #2b313c, #1a1e27);
+    color: var(--text-2);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.search-star[aria-pressed="true"] {
+    border-color: var(--teal);
+    color: var(--teal);
+    text-shadow: 0 0 6px rgba(77, 208, 200, 0.6);
+}
+
+/* Desktop: a side panel */
+@media (min-width: 901px) {
+    .search-drawer {
+        left: auto;
+        top: 0;
+        bottom: 0; /* full height, so the results list scrolls inside it */
+        width: 400px;
+        max-height: none;
+        border-radius: 0;
+        box-shadow: -8px 0 30px rgba(0, 0, 0, 0.6);
+    }
+}
+
+@media (min-width: 901px) and (prefers-reduced-motion: no-preference) {
+    .search-drawer { animation: drawer-in 0.22s ease-out; }
 }
