@@ -1,3 +1,6 @@
+use crate::my_stations::{MyEntry, MyError, MyStore};
+use crate::radiobrowser::RbStation;
+use crate::search_cache::SearchCache;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,6 +30,41 @@ pub struct StationRegistry {
     pub groups: Vec<StationGroup>,
 }
 
+/// A station as `GET /api/stations` shows it: no URL, plus whether it is in MY.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StationView {
+    pub id: String,
+    pub name: String,
+    pub short: String,
+    pub genre: String,
+    pub in_my: bool,
+}
+
+impl StationView {
+    fn from_station(station: &Station, in_my: bool) -> Self {
+        Self {
+            id: station.id.clone(),
+            name: station.name.clone(),
+            short: station.short.clone(),
+            genre: station.genre.clone(),
+            in_my,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupView {
+    pub id: String,
+    pub label: String,
+    pub stations: Vec<StationView>,
+}
+
+/// The `Stations` API shape: the ROCK and CLIAMP groups plus the `my` group.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegistryView {
+    pub groups: Vec<GroupView>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RockStationsFile {
     station: Vec<Station>,
@@ -53,6 +91,10 @@ pub struct StationManager {
     station_urls: HashMap<String, String>,
     cache_path: PathBuf,
     remote_url: String,
+    /// The household's MY list, `<cache_dir>/my-stations.json`.
+    my: MyStore,
+    /// Recent search results, so they can be played or kept by id.
+    search_cache: SearchCache,
 }
 
 impl StationManager {
@@ -68,6 +110,7 @@ impl StationManager {
         tokio::fs::create_dir_all(cache_dir).await.ok();
 
         let cache_path = cache_dir.join("cliamp-stations.json");
+        let my = MyStore::load(cache_dir.join("my-stations.json"));
 
         // Load cliamp stations
         let cliamp_stations = Self::fetch_cliamp_stations(&remote_url, &cache_path).await;
@@ -78,6 +121,8 @@ impl StationManager {
             station_urls: HashMap::new(),
             cache_path,
             remote_url,
+            my,
+            search_cache: SearchCache::new(),
         };
 
         manager.rebuild_url_map();
@@ -188,8 +233,14 @@ impl StationManager {
         }
     }
 
+    /// The stream URL for a station id: ROCK/CLIAMP from the registry, then a
+    /// Radio Browser station saved in MY. Unsaved search results are resolved
+    /// by the API layer, never here.
     pub fn get_station_url(&self, id: &str) -> Option<&str> {
-        self.station_urls.get(id).map(|s| s.as_str())
+        if let Some(url) = self.station_urls.get(id) {
+            return Some(url.as_str());
+        }
+        self.my.get_rb(id).map(|station| station.url.as_str())
     }
 
     pub fn get_station_name(&self, id: &str) -> Option<String> {
@@ -198,6 +249,86 @@ impl StationManager {
             .chain(self.cliamp_stations.iter())
             .find(|s| s.id == id)
             .map(|s| s.name.clone())
+    }
+
+    /// True for a ROCK or CLIAMP station id.
+    pub fn is_curated(&self, id: &str) -> bool {
+        self.station_urls.contains_key(id)
+    }
+
+    /// True when `id` is in MY.
+    pub fn is_in_my(&self, id: &str) -> bool {
+        self.my.contains(id)
+    }
+
+    /// Adds an entry to MY; `Ok(false)` when it was already there.
+    pub async fn my_add(&mut self, entry: MyEntry) -> Result<bool, MyError> {
+        self.my.add(entry).await
+    }
+
+    /// Removes an entry from MY; `Ok(false)` when it was not there.
+    pub async fn my_remove(&mut self, id: &str) -> Result<bool, MyError> {
+        self.my.remove(id).await
+    }
+
+    /// Remembers search results so they can be played or kept by id.
+    pub fn remember_search_results(&mut self, stations: &[RbStation]) {
+        self.search_cache.insert_all(stations, time::Instant::now());
+    }
+
+    /// A recent search result by id, if it has not expired.
+    pub fn cached_search_result(&self, id: &str) -> Option<RbStation> {
+        self.search_cache.get(id, time::Instant::now())
+    }
+
+    /// The registry as the API shows it: ROCK and CLIAMP flagged with `in_my`,
+    /// plus the `my` group in insertion order. A reference whose station is
+    /// gone is left out (but stays in the file).
+    pub fn registry_view(&self) -> RegistryView {
+        let registry = self.get_registry();
+
+        let mut my_stations: Vec<StationView> = Vec::new();
+        for entry in self.my.entries() {
+            match entry {
+                MyEntry::Ref { station_id } => {
+                    let found = registry
+                        .groups
+                        .iter()
+                        .flat_map(|group| &group.stations)
+                        .find(|station| &station.id == station_id);
+                    if let Some(station) = found {
+                        my_stations.push(StationView::from_station(station, true));
+                    }
+                }
+                MyEntry::Rb(stored) => my_stations.push(StationView {
+                    id: stored.id.clone(),
+                    name: stored.name.clone(),
+                    short: stored.short.clone(),
+                    genre: stored.genre.clone(),
+                    in_my: true,
+                }),
+            }
+        }
+
+        let mut groups: Vec<GroupView> = registry
+            .groups
+            .iter()
+            .map(|group| GroupView {
+                id: group.id.clone(),
+                label: group.label.clone(),
+                stations: group
+                    .stations
+                    .iter()
+                    .map(|station| StationView::from_station(station, self.my.contains(&station.id)))
+                    .collect(),
+            })
+            .collect();
+        groups.push(GroupView {
+            id: "my".to_string(),
+            label: "MY".to_string(),
+            stations: my_stations,
+        });
+        RegistryView { groups }
     }
 
     /// Start background refresh task
@@ -283,11 +414,129 @@ mod tests {
             station_urls: HashMap::new(),
             cache_path: PathBuf::new(),
             remote_url: String::new(),
+            my: MyStore::load(PathBuf::from("/nonexistent/my-stations.json")),
+            search_cache: SearchCache::new(),
         };
 
         manager.rebuild_url_map();
 
         // Rock takes precedence
         assert_eq!(manager.get_station_url("test"), Some("http://rock"));
+    }
+
+    const UUID_A: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn curated(id: &str, url: &str) -> Station {
+        Station {
+            id: id.to_string(),
+            name: format!("{id} name"),
+            short: id.to_string(),
+            genre: "Rock".to_string(),
+            url: url.to_string(),
+        }
+    }
+
+    fn rb_station(uuid: &str, url: &str) -> RbStation {
+        RbStation {
+            uuid: uuid.to_string(),
+            name: "Jazz FM".to_string(),
+            genre: "jazz".to_string(),
+            country: "France".to_string(),
+            bitrate: 128,
+            url: url.to_string(),
+        }
+    }
+
+    fn stored(station: &RbStation) -> MyEntry {
+        MyEntry::Rb(crate::my_stations::StoredRbStation::from_rb(station))
+    }
+
+    /// A manager with one ROCK (`big100`) and one CLIAMP (`lofi`) station and
+    /// an empty MY list stored in `dir`.
+    fn manager_in(dir: &Path) -> StationManager {
+        let mut manager = StationManager {
+            rock_stations: vec![curated("big100", "http://rock/big100")],
+            cliamp_stations: vec![curated("lofi", "http://cliamp/lofi")],
+            station_urls: HashMap::new(),
+            cache_path: PathBuf::new(),
+            remote_url: String::new(),
+            my: MyStore::load(dir.join("my-stations.json")),
+            search_cache: SearchCache::new(),
+        };
+        manager.rebuild_url_map();
+        manager
+    }
+
+    fn group<'a>(view: &'a RegistryView, id: &str) -> &'a GroupView {
+        view.groups.iter().find(|group| group.id == id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_view_adds_an_empty_my_group_and_in_my_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_in(dir.path());
+        let view = manager.registry_view();
+        let ids: Vec<&str> = view.groups.iter().map(|group| group.id.as_str()).collect();
+        assert_eq!(ids, vec!["rock", "cliamp", "my"]);
+        assert_eq!(group(&view, "my").label, "MY");
+        assert!(group(&view, "my").stations.is_empty());
+        assert!(!group(&view, "rock").stations[0].in_my);
+    }
+
+    #[tokio::test]
+    async fn my_group_lists_refs_and_rb_stations_in_insertion_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let rb = rb_station(UUID_A, "https://jazz.example/stream");
+        manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
+        manager.my_add(stored(&rb)).await.unwrap();
+        manager.my_add(MyEntry::Ref { station_id: "big100".to_string() }).await.unwrap();
+
+        let view = manager.registry_view();
+        let my_ids: Vec<&str> = group(&view, "my").stations.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(my_ids, vec!["lofi", &format!("rb-{UUID_A}")[..], "big100"]);
+        assert!(group(&view, "my").stations.iter().all(|s| s.in_my));
+        assert!(group(&view, "rock").stations[0].in_my, "big100 is flagged in its own band");
+        assert!(group(&view, "cliamp").stations[0].in_my);
+
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("jazz.example"), "stream URLs never reach the API: {json}");
+    }
+
+    #[tokio::test]
+    async fn a_dangling_reference_is_hidden_and_reappears_with_its_station() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        manager.my_add(MyEntry::Ref { station_id: "gone".to_string() }).await.unwrap();
+        assert!(group(&manager.registry_view(), "my").stations.is_empty());
+
+        manager.cliamp_stations.push(curated("gone", "http://cliamp/gone"));
+        manager.rebuild_url_map();
+        let view = manager.registry_view();
+        assert_eq!(group(&view, "my").stations[0].id, "gone");
+    }
+
+    #[tokio::test]
+    async fn urls_resolve_for_curated_and_saved_stations_but_not_for_search_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let saved = rb_station(UUID_A, "https://jazz.example/stream");
+        let other = rb_station("22222222-2222-2222-2222-222222222222", "https://other.example/stream");
+        manager.my_add(stored(&saved)).await.unwrap();
+        manager.remember_search_results(std::slice::from_ref(&other));
+
+        assert_eq!(manager.get_station_url("big100"), Some("http://rock/big100"));
+        assert_eq!(manager.get_station_url(&saved.id()), Some("https://jazz.example/stream"));
+        assert_eq!(manager.get_station_url(&other.id()), None);
+        assert_eq!(manager.cached_search_result(&other.id()), Some(other));
+    }
+
+    #[tokio::test]
+    async fn curated_ids_are_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_in(dir.path());
+        assert!(manager.is_curated("big100"));
+        assert!(manager.is_curated("lofi"));
+        assert!(!manager.is_curated(&format!("rb-{UUID_A}")));
     }
 }
