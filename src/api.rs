@@ -237,7 +237,7 @@ fn search_unavailable() -> Response {
 /// A station id after the server has looked up where to find its stream.
 enum ResolvedStation {
     /// ROCK, CLIAMP or a saved MY station: the URL is already known.
-    Known,
+    Known { url: String },
     /// An unsaved Radio Browser station, from the search cache or `by_uuid`.
     Discovered(RbStation),
 }
@@ -247,8 +247,8 @@ enum ResolvedStation {
 async fn resolve_station(state: &AppState, id: &str) -> Result<ResolvedStation, Response> {
     {
         let stations = state.stations.read().await;
-        if stations.get_station_url(id).is_some() {
-            return Ok(ResolvedStation::Known);
+        if let Some(url) = stations.get_station_url(id) {
+            return Ok(ResolvedStation::Known { url: url.to_string() });
         }
         if let Some(found) = stations.cached_search_result(id) {
             return Ok(ResolvedStation::Discovered(found));
@@ -317,7 +317,7 @@ async fn add_my_station(
     Json(req): Json<MyRequest>,
 ) -> Result<Json<RegistryView>, Response> {
     let entry = match resolve_station(&state, &req.station).await? {
-        ResolvedStation::Known => {
+        ResolvedStation::Known { .. } => {
             let stations = state.stations.read().await;
             if stations.is_in_my(&req.station) {
                 return Ok(Json(stations.registry_view()));
@@ -407,15 +407,15 @@ async fn play_station(
     AxumState(state): AxumState<AppState>,
     Json(req): Json<PlayRequest>,
 ) -> Result<Json<State>, Response> {
+    // Resolve the id first: a Radio Browser lookup can take seconds and must not
+    // hold up other plays. The client only ever supplies the id, never a URL.
+    let (station_url, discovered) = match resolve_station(&state, &req.station).await? {
+        ResolvedStation::Known { url } => (url, None),
+        ResolvedStation::Discovered(found) => (found.url.clone(), Some(found)),
+    };
+
     // Serialize play operations
     let _guard = state.play_mutex.lock().await;
-
-    let stations = state.stations.read().await;
-    let station_url = stations
-        .get_station_url(&req.station)
-        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "unknown_station", "Station not found"))?
-        .to_string();
-    drop(stations);
 
     // Snapshot LIVE receiver state (the cache can be seconds old, and a
     // TV that just switched to hdmi1 must be seen as such).
@@ -462,6 +462,16 @@ async fn play_station(
     })?;
 
     state.state_manager.set_last_played_station(req.station.clone()).await;
+    {
+        // Only a station that is neither saved nor curated is "discovered"; the
+        // check is repeated here because MY can change after the lookup.
+        let mut stations = state.stations.write().await;
+        let playing_id = discovered.as_ref().map_or_else(|| req.station.clone(), |found| found.id());
+        let unsaved = discovered
+            .as_ref()
+            .filter(|found| !stations.is_in_my(&found.id()) && !stations.is_curated(&found.id()));
+        stations.note_playing(&playing_id, unsaved);
+    }
     {
         let mut tracking = state.route_tracking.lock().unwrap();
         tracking.selection = Some(selected.clone());

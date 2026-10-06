@@ -417,6 +417,10 @@ impl FakeRadioBrowser {
     fn is_down(&self) -> bool {
         self.down.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn by_uuid_call_count(&self) -> usize {
+        self.by_uuid_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[async_trait::async_trait]
@@ -2560,4 +2564,108 @@ async fn my_changes_are_pushed_as_a_stations_event() {
     let received = read_sse_until(&mut events, "event: stations").await;
     assert!(received.contains(r#""id":"my""#), "{received:?}");
     assert!(received.contains(r#""in_my":true"#), "{received:?}");
+}
+
+// ---- Station discovery: playing rb- ids ----
+
+#[tokio::test]
+async fn play_resolves_an_unsaved_station_with_by_uuid_then_the_cache() {
+    let app = discovery_app().await;
+    let jazz_id = format!("rb-{JAZZ_UUID}");
+
+    let first = app.server.post("/api/play").json(&json!({"station": jazz_id})).await;
+    first.assert_status_ok();
+    assert_eq!(app.radio_browser.by_uuid_call_count(), 1);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("http://jazz.example.com/stream"));
+    let state: serde_json::Value = first.json();
+    assert_eq!(state["player"]["station_name"], "Smooth Jazz Radio");
+
+    // The result is now cached: playing it again does not ask Radio Browser.
+    app.server.post("/api/play").json(&json!({"station": jazz_id})).await.assert_status_ok();
+    assert_eq!(app.radio_browser.by_uuid_call_count(), 1);
+}
+
+#[tokio::test]
+async fn play_uses_the_search_cache_when_radio_browser_goes_down() {
+    let app = discovery_app().await;
+    app.server.get("/api/search").add_query_param("q", "blues").await.assert_status_ok();
+    app.radio_browser.set_down(true);
+
+    let response = app.server.post("/api/play").json(&json!({"station": format!("rb-{BLUES_UUID}")})).await;
+
+    response.assert_status_ok();
+    assert_eq!(app.radio_browser.by_uuid_call_count(), 0);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("https://blues.example.com/live"));
+}
+
+#[tokio::test]
+async fn play_uses_my_after_a_restart_without_asking_radio_browser() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let first = build_app_in(cache_dir.path(), Arc::new(MockYxcClient::new()), fast_timing(), None).await;
+    first.server.get("/api/search").add_query_param("q", "jazz").await.assert_status_ok();
+    let jazz_id = format!("rb-{JAZZ_UUID}");
+    first.server.post("/api/my").json(&json!({"station": jazz_id})).await.assert_status_ok();
+    drop(first);
+
+    let second = build_app_in(cache_dir.path(), Arc::new(MockYxcClient::new()), fast_timing(), None).await;
+    second.radio_browser.set_down(true);
+    let response = second.server.post("/api/play").json(&json!({"station": jazz_id})).await;
+
+    response.assert_status_ok();
+    assert_eq!(second.radio_browser.by_uuid_call_count(), 0);
+    let player_state = cliamp::Player::state(second.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("http://jazz.example.com/stream"));
+}
+
+#[tokio::test]
+async fn play_rejects_ids_that_are_not_known_stations() {
+    let app = discovery_app().await;
+
+    // A URL in the station field is just an unknown id.
+    let url_as_id = app
+        .server
+        .post("/api/play")
+        .json(&json!({"station": "http://evil.example.com/stream"}))
+        .await;
+    url_as_id.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(url_as_id.json::<serde_json::Value>()["error"], "unknown_station");
+
+    // A URL smuggled in an extra field is ignored: the id still decides.
+    let extra_field = app
+        .server
+        .post("/api/play")
+        .json(&json!({"station": "nonexistent", "url": "http://evil.example.com/stream"}))
+        .await;
+    extra_field.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // A malformed rb- id never reaches Radio Browser.
+    let malformed = app.server.post("/api/play").json(&json!({"station": "rb-../../etc"})).await;
+    malformed.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(malformed.json::<serde_json::Value>()["error"], "bad_station");
+
+    // A well-formed rb- id that Radio Browser does not know.
+    let missing = app
+        .server
+        .post("/api/play")
+        .json(&json!({"station": "rb-99999999-9999-9999-9999-999999999999"}))
+        .await;
+    missing.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(missing.json::<serde_json::Value>()["error"], "unknown_station");
+
+    assert_eq!(app.radio_browser.by_uuid_call_count(), 1);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url, None);
+}
+
+#[tokio::test]
+async fn play_reports_unavailable_when_an_unsaved_station_cannot_be_looked_up() {
+    let app = discovery_app().await;
+    app.radio_browser.set_down(true);
+
+    let response = app.server.post("/api/play").json(&json!({"station": format!("rb-{JAZZ_UUID}")})).await;
+
+    response.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.json::<serde_json::Value>()["error"], "search_unavailable");
 }
