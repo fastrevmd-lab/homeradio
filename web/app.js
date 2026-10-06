@@ -640,7 +640,10 @@ function updatePresetSelection(stationId) {
 // the knob's real minimum (zone.min_db) is still reachable. Values are never
 // clamped to a "nicer" floor, so the knob never misreports the actual level.
 const KNOB_CURVE = 2;
-const KNOB_SWEEP_DEGREES = 270;
+// Half a turn: the indicator rests at 3 o'clock at the minimum and travels
+// clockwise, round the bottom, to 9 o'clock at the cap.
+const KNOB_SWEEP_DEGREES = 180;
+const KNOB_REST_DEGREES = 90;
 // One drag gesture may move the level at most this many dB per pixel of travel
 // (6 dB per 20 px), whatever the taper says.
 const KNOB_MAX_DB_PER_PIXEL = 6 / 20;
@@ -656,7 +659,7 @@ function positionToDb(position, minDb, capDb) {
 }
 
 function positionToAngle(position) {
-    return position * KNOB_SWEEP_DEGREES - KNOB_SWEEP_DEGREES / 2;
+    return KNOB_REST_DEGREES + position * KNOB_SWEEP_DEGREES;
 }
 
 function isKnobDisabled(knob) {
@@ -1004,7 +1007,8 @@ function setupVolumeKnob(zoneId, knob) {
         if (!isDraggingKnob || activeKnob !== knob) return;
 
         const { minDb, capDb, stepDb } = knobRange();
-        const positionDelta = ((startY - e.clientY) * DEGREES_PER_PIXEL) / KNOB_SWEEP_DEGREES;
+        // Pulling down turns the knob clockwise (louder), like dragging its right edge
+        const positionDelta = ((e.clientY - startY) * DEGREES_PER_PIXEL) / KNOB_SWEEP_DEGREES;
         const rawDb = positionToDb(startPosition + positionDelta, minDb, capDb);
         // Never travel faster than KNOB_MAX_DB_PER_PIXEL from where the drag began
         const maxTravelDb = Math.abs(startY - e.clientY) * KNOB_MAX_DB_PER_PIXEL;

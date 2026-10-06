@@ -1095,7 +1095,7 @@ body::before {
     border-radius: 2px;
     background: linear-gradient(to bottom, #8ff5ec, var(--teal-deep));
     box-shadow: 0 0 6px rgba(77, 208, 200, 0.8);
-    transform: translateX(-50%) rotate(-135deg);
+    transform: translateX(-50%) rotate(90deg);
     transform-origin: 50% 27px;
 }
 
