@@ -3,7 +3,7 @@
 use crate::cliamp::Player;
 use crate::config::Config;
 use crate::policy::{self, ZoneSelection, ZoneSnapshot};
-use crate::radiobrowser::RadioBrowser;
+use crate::radiobrowser::{self, RadioBrowser};
 use crate::route::AudioRoute;
 use crate::state::{State, StateManager, ZoneLive, ZoneOverride};
 use crate::stations::{RegistryView, StationManager};
@@ -11,7 +11,7 @@ use crate::vis::VisHub;
 use crate::volume;
 use crate::yxc::{YxcClient, YxcError};
 use axum::{
-    extract::{Path, State as AxumState},
+    extract::{Path, Query, State as AxumState},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
@@ -171,6 +171,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/api/state", get(get_state))
         .route("/api/stations", get(get_stations))
+        .route("/api/search", get(search_stations))
         .route("/api/play", post(play_station))
         .route("/api/stop", post(stop_player))
         .route("/api/power", post(set_master_power))
@@ -190,6 +191,92 @@ async fn get_state(AxumState(state): AxumState<AppState>) -> Json<State> {
 async fn get_stations(AxumState(state): AxumState<AppState>) -> Json<RegistryView> {
     let stations = state.stations.read().await;
     Json(stations.registry_view())
+}
+
+/// Shortest `q` that searches by name.
+const SEARCH_MIN_QUERY_CHARS: usize = 2;
+/// `q` is cut to this many characters before it is sent on.
+const SEARCH_MAX_QUERY_CHARS: usize = 80;
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+    genre: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResult {
+    id: String,
+    name: String,
+    genre: String,
+    country: String,
+    bitrate: u32,
+    in_my: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    results: Vec<SearchResult>,
+}
+
+fn bad_query(detail: &str) -> Response {
+    error_response(StatusCode::BAD_REQUEST, "bad_query", detail)
+}
+
+fn search_unavailable() -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "search_unavailable",
+        "Station search is unavailable right now",
+    )
+}
+
+/// `GET /api/search?q=…&genre=…`: Radio Browser stations by name and/or genre
+/// chip. The results are remembered briefly so they can be played or kept by id.
+async fn search_stations(
+    AxumState(state): AxumState<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, Response> {
+    let name: Option<String> = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| text.chars().count() >= SEARCH_MIN_QUERY_CHARS)
+        .map(|text| text.chars().take(SEARCH_MAX_QUERY_CHARS).collect());
+    let tag = match query.genre.as_deref().filter(|label| !label.is_empty()) {
+        Some(label) => Some(
+            radiobrowser::genre_tag(label)
+                .ok_or_else(|| bad_query("genre must be one of the genre chips"))?,
+        ),
+        None => None,
+    };
+    if name.is_none() && tag.is_none() {
+        return Err(bad_query("search needs at least 2 characters or a genre"));
+    }
+
+    let found = state
+        .radio_browser
+        .search(name.as_deref(), tag.as_deref())
+        .await
+        .map_err(|e| {
+            warn!("Radio Browser search failed: {}", e);
+            search_unavailable()
+        })?;
+
+    let mut stations = state.stations.write().await;
+    stations.remember_search_results(&found);
+    let results = found
+        .iter()
+        .map(|station| SearchResult {
+            id: station.id(),
+            name: station.name.clone(),
+            genre: station.genre.clone(),
+            country: station.country.clone(),
+            bitrate: station.bitrate,
+            in_my: stations.is_in_my(&station.id()),
+        })
+        .collect();
+    Ok(Json(SearchResponse { results }))
 }
 
 async fn play_station(

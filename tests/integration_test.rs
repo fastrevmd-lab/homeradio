@@ -386,6 +386,7 @@ struct TestApp {
     route: Arc<MockAudioRoute>,
     player: Arc<MockPlayer>,
     events: Events,
+    radio_browser: Arc<FakeRadioBrowser>,
     /// Owns the cache dir (and `my-stations.json`); gone when the test ends.
     _cache_dir: Option<tempfile::TempDir>,
 }
@@ -407,6 +408,10 @@ impl FakeRadioBrowser {
             by_uuid_calls: std::sync::atomic::AtomicUsize::new(0),
             searches: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn set_down(&self, down: bool) {
+        self.down.store(down, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn is_down(&self) -> bool {
@@ -530,6 +535,7 @@ async fn build_app_in(
     // Manually trigger a refresh so tests don't have to wait
     state_manager.refresh().await;
 
+    let radio_browser = Arc::new(FakeRadioBrowser::new(fake_stations()));
     let app_state = api::AppState {
         yxc,
         player,
@@ -547,7 +553,7 @@ async fn build_app_in(
             player_mock.clone() as Arc<dyn cliamp::Player>,
             vis::VisConfig::default(),
         ),
-        radio_browser: Arc::new(FakeRadioBrowser::new(fake_stations())),
+        radio_browser: radio_browser.clone(),
         stations_tx: tokio::sync::broadcast::channel(16).0,
     };
 
@@ -557,6 +563,7 @@ async fn build_app_in(
         route: route_mock,
         player: player_mock,
         events,
+        radio_browser,
         _cache_dir: None,
     }
 }
@@ -2322,6 +2329,87 @@ async fn test_power_and_stop_wait_for_the_play_mutex() {
 
 async fn discovery_app() -> TestApp {
     build_app(Arc::new(MockYxcClient::new()), fast_timing(), None).await
+}
+
+#[tokio::test]
+async fn search_by_name_returns_ids_only_results() {
+    let app = discovery_app().await;
+
+    let response = app.server.get("/api/search").add_query_param("q", "jazz").await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["id"], format!("rb-{JAZZ_UUID}"));
+    assert_eq!(results[0]["name"], "Smooth Jazz Radio");
+    assert_eq!(results[0]["genre"], "jazz");
+    assert_eq!(results[0]["country"], "Canada");
+    assert_eq!(results[0]["bitrate"], 128);
+    assert_eq!(results[0]["in_my"], false);
+    // The stream URL never leaves the server.
+    assert!(!body.to_string().contains("example.com"));
+}
+
+#[tokio::test]
+async fn search_maps_the_genre_chip_to_a_radio_browser_tag() {
+    let app = discovery_app().await;
+
+    app.server
+        .get("/api/search")
+        .add_query_param("genre", "Alt")
+        .await
+        .assert_status_ok();
+    app.server
+        .get("/api/search")
+        .add_query_param("q", "  radio  ")
+        .add_query_param("genre", "Classic Rock")
+        .await
+        .assert_status_ok();
+
+    let searches = app.radio_browser.searches.lock().unwrap().clone();
+    assert_eq!(
+        searches,
+        vec![
+            (None, Some("alternative".to_string())),
+            (Some("radio".to_string()), Some("classic rock".to_string())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn search_rejects_bad_queries() {
+    let app = discovery_app().await;
+
+    for query in [
+        vec![],
+        vec![("q", "a")],
+        vec![("q", "   ")],
+        vec![("genre", "Polka")],
+        vec![("q", "jazz"), ("genre", "Polka")],
+    ] {
+        let mut request = app.server.get("/api/search");
+        for (key, value) in query {
+            request = request.add_query_param(key, value);
+        }
+        let response = request.await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"], "bad_query");
+    }
+    assert!(app.radio_browser.searches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_reports_unavailable_when_radio_browser_is_down() {
+    let app = discovery_app().await;
+    app.radio_browser.set_down(true);
+
+    let response = app.server.get("/api/search").add_query_param("q", "jazz").await;
+
+    response.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"], "search_unavailable");
 }
 
 #[tokio::test]
