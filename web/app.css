@@ -515,7 +515,7 @@ body::before {
     border: 0;
     border-radius: 4px;
     background: #052a28;
-    color: rgba(143, 245, 236, 0.35);
+    color: rgba(143, 245, 236, 0.55); /* >= 3:1 on the LCD green */
     font-size: 17px;
     line-height: 1;
     cursor: pointer;
@@ -838,6 +838,9 @@ body::before {
 .band-switch {
     position: relative;
     display: inline-block;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 240px;
     cursor: pointer;
 }
 
@@ -845,7 +848,7 @@ body::before {
     position: relative;
     display: flex;
     align-items: center;
-    width: 240px;
+    width: 100%;
     padding: 6px;
     border-radius: 999px;
     border: 1px solid var(--border);
@@ -903,6 +906,7 @@ body::before {
 
 /* Search button beside the band switch: a small round metal key */
 .search-btn {
+    flex: none;
     width: 34px;
     height: 34px;
     padding: 0;
@@ -946,7 +950,9 @@ body::before {
 .preset-btn {
     position: relative;
     min-width: 0;
-    overflow-wrap: anywhere;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     padding: 12px 6px 10px;
     border-radius: 6px;
     font-size: 11px;
