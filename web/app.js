@@ -13,6 +13,7 @@ let lastSeenStation = null; // band auto-follow only when this changes
 let lastPlayedId = null; // the star's target while nothing is playing
 let stationsRevision = 0; // revision of the Stations snapshot on screen; older ones (same boot) are ignored
 let stationsBoot = null; // server boot id of that snapshot; a new boot resets the revision
+const retiredStationsBoots = new Set(); // boots replaced by a newer one; their late snapshots are ignored
 let stationsStale = false; // the event stream dropped: refetch stations once it is back
 let pendingFollowStation = null; // station change that arrived mid-drag; applied on drag end
 let lcdHoldActive = false;  // an error message currently owns the LCD
@@ -202,17 +203,21 @@ async function refetchStations() {
  * A snapshot older than the one already shown (by `revision`) is ignored, so
  * out-of-order SSE events, responses and refetches cannot roll the UI back.
  * Revisions are only comparable within one server `boot`: a snapshot from a
- * different boot (the server restarted) is always accepted and resets the
- * remembered revision.
+ * different boot (the server restarted) is accepted and resets the remembered
+ * revision, and the boot it replaces is retired: a late snapshot from a retired
+ * boot (a response still in flight across the restart) is ignored.
  * @param {?{groups: Array, revision?: number, boot?: string}} data the Stations JSON, or null when a request failed
  */
 function applyStations(data) {
     if (!data || !Array.isArray(data.groups)) return;
     if (typeof data.revision === 'number') {
-        const sameBoot = (data.boot ?? null) === stationsBoot;
+        const boot = data.boot ?? null;
+        if (retiredStationsBoots.has(boot)) return;
+        const sameBoot = boot === stationsBoot;
         if (sameBoot && data.revision < stationsRevision) return;
+        if (!sameBoot) retiredStationsBoots.add(stationsBoot);
         stationsRevision = data.revision;
-        stationsBoot = data.boot ?? null;
+        stationsBoot = boot;
     }
     const selectedId = getCurrentGroup()?.stations[selectedStationIndex]?.id;
     stations = data;

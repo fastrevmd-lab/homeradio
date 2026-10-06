@@ -64,13 +64,24 @@ pub struct GroupView {
 pub struct RegistryView {
     /// Identifies this server process: generated once at startup and different
     /// on every boot. `revision` is only comparable within one `boot`, so a
-    /// client that sees a new `boot` accepts the snapshot whatever its revision.
+    /// client that sees a new `boot` accepts the snapshot whatever its revision
+    /// (the wall clock behind the revision seed can step back).
     pub boot: String,
-    /// Rises on every MY or CLIAMP change within one `boot` (it starts at 0 on
-    /// each boot), so a client can discard a snapshot older than the one it
-    /// already shows.
+    /// Rises on every MY or CLIAMP change, so a client can discard a snapshot
+    /// older than the one it already shows. Each boot seeds it from the wall
+    /// clock (milliseconds), so a page from a build that predates `boot` and
+    /// compares revisions alone is not left behind by a restart.
     pub revision: u64,
     pub groups: Vec<GroupView>,
+}
+
+/// Where a new manager's revision counter starts: milliseconds since the epoch.
+/// Pages from builds that predate `boot` compare revisions on this scale, so a
+/// restart must not drop below it; `boot` covers a clock that stepped back.
+fn initial_revision() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// A boot identifier that differs between processes and between managers in one
@@ -151,7 +162,7 @@ impl StationManager {
             my,
             search_cache: SearchCache::new(),
             playing_rb: None,
-            revision: 0,
+            revision: initial_revision(),
             boot: new_boot_id(),
         };
 
@@ -544,7 +555,7 @@ mod tests {
             my: MyStore::load(dir.join("my-stations.json")),
             search_cache: SearchCache::new(),
             playing_rb: None,
-            revision: 0,
+            revision: initial_revision(),
             boot: new_boot_id(),
         };
         manager.rebuild_url_map();
@@ -598,7 +609,6 @@ mod tests {
         manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
         let second = serde_json::to_value(manager.registry_view()).unwrap();
         assert_eq!(second["boot"], first["boot"], "a MY change does not start a new boot");
-        assert_eq!(first["revision"], 0, "the revision is a plain counter");
     }
 
     #[tokio::test]
@@ -607,6 +617,25 @@ mod tests {
         let earlier = manager_in(dir.path()).registry_view().boot;
         let later = manager_in(dir.path()).registry_view().boot;
         assert_ne!(earlier, later, "a client must be able to tell the restart apart");
+    }
+
+    #[tokio::test]
+    async fn a_new_manager_seeds_the_revision_from_the_wall_clock_in_milliseconds() {
+        // An already-open page from an older build compares revisions on this
+        // scale and has no `boot`, so a restarted server must not drop below it.
+        let dir = tempfile::tempdir().unwrap();
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let manager = StationManager::new(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("config/stations.toml"),
+            dir.path(),
+            "http://127.0.0.1:9/stations".to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(manager.registry_view().revision >= before_ms);
     }
 
     #[tokio::test]
