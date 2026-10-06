@@ -3,7 +3,8 @@
 use crate::cliamp::Player;
 use crate::config::Config;
 use crate::policy::{self, ZoneSelection, ZoneSnapshot};
-use crate::radiobrowser::{self, RadioBrowser};
+use crate::my_stations::{MyEntry, MyError, StoredRbStation, MY_CAP};
+use crate::radiobrowser::{self, RadioBrowser, RbStation};
 use crate::route::AudioRoute;
 use crate::state::{State, StateManager, ZoneLive, ZoneOverride};
 use crate::stations::{RegistryView, StationManager};
@@ -17,7 +18,7 @@ use axum::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
-use tokio_stream::wrappers::{ReceiverStream, WatchStream};
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, WatchStream};
 use tokio_stream::{Stream, StreamExt};
 use tracing::{error, warn};
 
@@ -172,6 +173,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/state", get(get_state))
         .route("/api/stations", get(get_stations))
         .route("/api/search", get(search_stations))
+        .route("/api/my", post(add_my_station))
+        .route("/api/my/{id}", delete(remove_my_station))
         .route("/api/play", post(play_station))
         .route("/api/stop", post(stop_player))
         .route("/api/power", post(set_master_power))
@@ -229,6 +232,127 @@ fn search_unavailable() -> Response {
         "search_unavailable",
         "Station search is unavailable right now",
     )
+}
+
+/// A station id after the server has looked up where to find its stream.
+enum ResolvedStation {
+    /// ROCK, CLIAMP or a saved MY station: the URL is already known.
+    Known,
+    /// An unsaved Radio Browser station, from the search cache or `by_uuid`.
+    Discovered(RbStation),
+}
+
+/// Resolves a client-supplied station id to a stream URL held by the server.
+/// The id is the only thing the client controls; it never supplies a URL.
+async fn resolve_station(state: &AppState, id: &str) -> Result<ResolvedStation, Response> {
+    {
+        let stations = state.stations.read().await;
+        if stations.get_station_url(id).is_some() {
+            return Ok(ResolvedStation::Known);
+        }
+        if let Some(found) = stations.cached_search_result(id) {
+            return Ok(ResolvedStation::Discovered(found));
+        }
+    }
+    let unknown = || error_response(StatusCode::BAD_REQUEST, "unknown_station", "Station not found");
+    if !id.starts_with("rb-") {
+        return Err(unknown());
+    }
+    let uuid = radiobrowser::rb_uuid(id).ok_or_else(|| {
+        error_response(StatusCode::BAD_REQUEST, "bad_station", "Malformed station id")
+    })?;
+    let found = state
+        .radio_browser
+        .by_uuid(uuid)
+        .await
+        .map_err(|e| {
+            warn!("Radio Browser lookup failed: {}", e);
+            search_unavailable()
+        })?
+        .ok_or_else(unknown)?;
+    state
+        .stations
+        .write()
+        .await
+        .remember_search_results(std::slice::from_ref(&found));
+    Ok(ResolvedStation::Discovered(found))
+}
+
+#[derive(Debug, Deserialize)]
+struct MyRequest {
+    station: String,
+}
+
+fn my_error_response(error: MyError) -> Response {
+    match error {
+        MyError::Full => error_response(
+            StatusCode::CONFLICT,
+            "my_full",
+            &format!("MY holds at most {} stations", MY_CAP),
+        ),
+        MyError::Save(io_error) => {
+            error!("Could not save the MY list: {}", io_error);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "my_save_failed",
+                "Could not save the MY list",
+            )
+        }
+    }
+}
+
+/// Tells every open browser the MY list changed. Called with the stations lock
+/// still held so events cannot be reordered. Having no listener is not an error.
+fn publish_stations(state: &AppState, view: &RegistryView) {
+    if let Ok(json) = serde_json::to_string(view) {
+        let _ = state.stations_tx.send(json);
+    }
+}
+
+/// `POST /api/my`: keeps a station in MY. Adding one already there is a no-op.
+/// Only a curated id (stored as a reference) or a Radio Browser station the
+/// server itself looked up (stored with its URL) is ever added.
+async fn add_my_station(
+    AxumState(state): AxumState<AppState>,
+    Json(req): Json<MyRequest>,
+) -> Result<Json<RegistryView>, Response> {
+    let entry = match resolve_station(&state, &req.station).await? {
+        ResolvedStation::Known => {
+            let stations = state.stations.read().await;
+            if stations.is_in_my(&req.station) {
+                return Ok(Json(stations.registry_view()));
+            }
+            // A saved MY station can be removed between resolving and here;
+            // only a curated id may become a reference.
+            if !stations.is_curated(&req.station) {
+                return Err(error_response(StatusCode::BAD_REQUEST, "unknown_station", "Station not found"));
+            }
+            MyEntry::Ref { station_id: req.station.clone() }
+        }
+        ResolvedStation::Discovered(found) => MyEntry::Rb(StoredRbStation::from_rb(&found)),
+    };
+
+    let mut stations = state.stations.write().await;
+    let changed = stations.my_add(entry).await.map_err(my_error_response)?;
+    let view = stations.registry_view();
+    if changed {
+        publish_stations(&state, &view);
+    }
+    Ok(Json(view))
+}
+
+/// `DELETE /api/my/{id}`: drops a station from MY. Removing one that is not there is a no-op.
+async fn remove_my_station(
+    AxumState(state): AxumState<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<RegistryView>, Response> {
+    let mut stations = state.stations.write().await;
+    let changed = stations.my_remove(&id).await.map_err(my_error_response)?;
+    let view = stations.registry_view();
+    if changed {
+        publish_stations(&state, &view);
+    }
+    Ok(Json(view))
 }
 
 /// `GET /api/search?q=…&genre=…`: Radio Browser stations by name and/or genre
@@ -689,13 +813,17 @@ async fn sse_handler(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.state_manager.subscribe();
 
-    let stream = WatchStream::new(rx).map(|state| {
+    let state_events = WatchStream::new(rx).map(|state| {
         Ok(Event::default()
             .event("state")
             .data(serde_json::to_string(&state).unwrap()))
     });
+    // A lagging receiver drops events; clients refetch /api/stations on reconnect.
+    let stations_events = BroadcastStream::new(state.stations_tx.subscribe())
+        .filter_map(|message| message.ok())
+        .map(|json| Ok(Event::default().event("stations").data(json)));
 
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Sse::new(state_events.merge(stations_events)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 /// `GET /api/vis`: SSE stream of spectrum frames (`event: vis`).

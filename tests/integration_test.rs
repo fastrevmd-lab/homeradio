@@ -2428,3 +2428,136 @@ async fn stations_view_has_an_empty_my_group_and_in_my_flags() {
     assert_eq!(first_curated["id"], "test");
     assert_eq!(first_curated["in_my"], false);
 }
+
+// ---- Station discovery: the MY list ----
+
+/// The ids in the `my` group of a `Stations` body, in order.
+fn my_ids(stations_body: &serde_json::Value) -> Vec<String> {
+    let groups = stations_body["groups"].as_array().unwrap();
+    let my = groups.iter().find(|group| group["id"] == "my").unwrap();
+    my["stations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|station| station["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn my_add_and_remove_a_curated_station() {
+    let app = discovery_app().await;
+
+    let added = app.server.post("/api/my").json(&json!({"station": "test"})).await;
+    added.assert_status_ok();
+    let added_body: serde_json::Value = added.json();
+    assert_eq!(my_ids(&added_body), vec!["test"]);
+    assert_eq!(added_body["groups"][0]["stations"][0]["in_my"], true);
+
+    // Adding again is a no-op.
+    let again: serde_json::Value = app.server.post("/api/my").json(&json!({"station": "test"})).await.json();
+    assert_eq!(my_ids(&again), vec!["test"]);
+
+    let removed = app.server.delete("/api/my/test").await;
+    removed.assert_status_ok();
+    assert!(my_ids(&removed.json::<serde_json::Value>()).is_empty());
+
+    // Removing again is a no-op, not an error.
+    app.server.delete("/api/my/test").await.assert_status_ok();
+}
+
+#[tokio::test]
+async fn my_add_a_search_result_by_id() {
+    let app = discovery_app().await;
+    app.server.get("/api/search").add_query_param("q", "jazz").await.assert_status_ok();
+    let jazz_id = format!("rb-{JAZZ_UUID}");
+
+    let added = app.server.post("/api/my").json(&json!({"station": jazz_id})).await;
+    added.assert_status_ok();
+    let body: serde_json::Value = added.json();
+
+    assert_eq!(my_ids(&body), vec![jazz_id.clone()]);
+    let saved = &body["groups"].as_array().unwrap().iter().find(|group| group["id"] == "my").unwrap()["stations"][0];
+    assert_eq!(saved["name"], "Smooth Jazz Radio");
+    assert_eq!(saved["in_my"], true);
+    assert!(!body.to_string().contains("example.com"));
+
+    let search: serde_json::Value = app.server.get("/api/search").add_query_param("q", "jazz").await.json();
+    assert_eq!(search["results"][0]["in_my"], true);
+    assert_eq!(search["results"][1]["in_my"], false);
+}
+
+#[tokio::test]
+async fn my_add_rejects_unknown_and_malformed_ids() {
+    let app = discovery_app().await;
+
+    let unknown = app.server.post("/api/my").json(&json!({"station": "nonexistent"})).await;
+    unknown.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(unknown.json::<serde_json::Value>()["error"], "unknown_station");
+
+    let malformed = app.server.post("/api/my").json(&json!({"station": "rb-not-a-uuid"})).await;
+    malformed.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(malformed.json::<serde_json::Value>()["error"], "bad_station");
+}
+
+#[tokio::test]
+async fn my_is_capped_at_fifty_stations() {
+    let app = discovery_app().await;
+    let mut stations = app.state.stations.write().await;
+    for number in 0..my_stations::MY_CAP {
+        let uuid = format!("00000000-0000-0000-0000-{number:012}");
+        let entry = my_stations::MyEntry::Rb(my_stations::StoredRbStation::from_rb(&radiobrowser::RbStation {
+            uuid,
+            name: format!("Filler {number}"),
+            genre: String::new(),
+            country: String::new(),
+            bitrate: 0,
+            url: "http://filler.example.com/stream".to_string(),
+        }));
+        stations.my_add(entry).await.unwrap();
+    }
+    drop(stations);
+
+    let response = app.server.post("/api/my").json(&json!({"station": "test"})).await;
+
+    response.assert_status(axum::http::StatusCode::CONFLICT);
+    assert_eq!(response.json::<serde_json::Value>()["error"], "my_full");
+}
+
+#[tokio::test]
+async fn my_survives_an_app_restart() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let first = build_app_in(cache_dir.path(), Arc::new(MockYxcClient::new()), fast_timing(), None).await;
+    first.server.get("/api/search").add_query_param("q", "jazz").await.assert_status_ok();
+    first.server.post("/api/my").json(&json!({"station": format!("rb-{JAZZ_UUID}")})).await.assert_status_ok();
+    first.server.post("/api/my").json(&json!({"station": "test"})).await.assert_status_ok();
+    drop(first);
+
+    let second = build_app_in(cache_dir.path(), Arc::new(MockYxcClient::new()), fast_timing(), None).await;
+    let body: serde_json::Value = second.server.get("/api/stations").await.json();
+
+    assert_eq!(my_ids(&body), vec![format!("rb-{JAZZ_UUID}"), "test".to_string()]);
+}
+
+#[tokio::test]
+async fn my_changes_are_pushed_as_a_stations_event() {
+    let app = discovery_app().await;
+    let state = app.state.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, api::create_router(state)).await.unwrap();
+    });
+    let mut events = reqwest::get(format!("http://{address}/api/events")).await.unwrap();
+    read_sse_until(&mut events, "event: state").await;
+
+    reqwest::Client::new()
+        .post(format!("http://{address}/api/my"))
+        .json(&json!({"station": "test"}))
+        .send()
+        .await
+        .unwrap();
+
+    let received = read_sse_until(&mut events, "event: stations").await;
+    assert!(received.contains(r#""id":"my""#), "{received:?}");
+    assert!(received.contains(r#""in_my":true"#), "{received:?}");
+}
