@@ -392,8 +392,9 @@ async fn search_stations(
             search_unavailable()
         })?;
 
-    let mut stations = state.stations.write().await;
-    stations.remember_search_results(&found);
+    // Write-lock only for the cache insert; `in_my` needs just a read lock.
+    state.stations.write().await.remember_search_results(&found);
+    let stations = state.stations.read().await;
     let results = found
         .iter()
         .map(|station| SearchResult {

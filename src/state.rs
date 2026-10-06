@@ -348,9 +348,13 @@ impl StateManager {
 
     pub async fn refresh(&self) {
         let player_state = self.player.state().await;
-        let stations = self.stations.read().await;
-
-        let player_info = self.build_player_info(&player_state, &stations).await;
+        // The stations lock is held only while the player info is built: the
+        // receiver calls below can take seconds, and a waiting writer would
+        // stall every reader behind it.
+        let player_info = {
+            let stations = self.stations.read().await;
+            self.build_player_info(&player_state, &stations).await
+        };
 
         let (receiver_info, mut zones) = self.fetch_receiver_state().await;
 

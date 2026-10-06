@@ -23,6 +23,8 @@ struct MockYxcClient {
     fail_set_power_for: Option<String>,
     /// A zone whose `get_zone_status` calls fail as unreachable.
     fail_status_for: Option<String>,
+    /// Artificial delay before `get_play_info` answers, in milliseconds.
+    play_info_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Arms a delayed AirPlay takeover: after `polls_left` more `get_zone_status`
@@ -94,6 +96,7 @@ impl MockYxcClient {
             override_volume_once: Arc::default(),
             fail_set_power_for: None,
             fail_status_for: None,
+            play_info_delay_ms: Arc::default(),
         }
     }
 
@@ -116,6 +119,7 @@ impl MockYxcClient {
             override_volume_once: Arc::default(),
             fail_set_power_for: None,
             fail_status_for: None,
+            play_info_delay_ms: Arc::default(),
         }
     }
 }
@@ -154,6 +158,10 @@ impl yxc::YxcClient for MockYxcClient {
     }
 
     async fn get_play_info(&self) -> Result<yxc::PlayInfo, yxc::YxcError> {
+        let delay_ms = self.play_info_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
         Ok(self.play_info.lock().await.clone())
     }
 
@@ -734,6 +742,7 @@ async fn test_power_on_already_on_no_volume_change() {
         override_volume_once: Arc::default(),
         fail_set_power_for: None,
         fail_status_for: None,
+        play_info_delay_ms: Arc::default(),
     };
 
     let yxc = Arc::new(yxc_mock) as Arc<dyn yxc::YxcClient>;
@@ -2674,6 +2683,23 @@ async fn play_rejects_ids_that_are_not_known_stations() {
     assert_eq!(app.radio_browser.by_uuid_call_count(), 1);
     let player_state = cliamp::Player::state(app.player.as_ref()).await;
     assert_eq!(player_state.url, None);
+}
+
+#[tokio::test]
+async fn a_slow_receiver_poll_does_not_block_station_writers() {
+    let mock = MockYxcClient::new();
+    let delay_ms = mock.play_info_delay_ms.clone();
+    let app = build_app(Arc::new(mock), fast_timing(), None).await;
+    delay_ms.store(600, std::sync::atomic::Ordering::SeqCst);
+
+    let state_manager = app.state.state_manager.clone();
+    let refresh = tokio::spawn(async move { state_manager.refresh().await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let writer = tokio::time::timeout(std::time::Duration::from_millis(200), app.state.stations.write()).await;
+    assert!(writer.is_ok(), "refresh held the stations lock across the receiver calls");
+    drop(writer);
+    refresh.await.unwrap();
 }
 
 #[tokio::test]
