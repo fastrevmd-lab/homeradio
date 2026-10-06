@@ -9,8 +9,11 @@ receiver, in one room, another room, or both. Anyone on the LAN can use it.
 <p align="center"><img src="docs/screenshot-2026-10-06_12-44-35.png" alt="homeradio: the boom box UI with spectrum analyser, tuning dial, presets and two zone controls" width="760"></p>
 
 - **Two zones.** A MEDIA ROOM / UPSTAIRS (receiver main + zone2) on-off switch and a
-  volume knob per room, 7 ROCK presets, a tuning dial over all stations with a
-  ROCK/CLIAMP band switch, PLAY and STOP.
+  volume knob per room, 7 presets and a tuning dial that follow a
+  ROCK/CLIAMP/MY band switch, PLAY and STOP.
+- **MY stations and search.** The search button looks up the public Radio Browser
+  directory by name or genre. The star on the display keeps a station in MY, one
+  shared list for the household (up to 50), stored in `cache_dir/my-stations.json`.
 - **Master power.** A power button by the logo: off stops the radio and puts both
   zones in standby (TV included); on wakes the main zone.
 - **Volume caps.** The knobs stop at per-zone caps set in the config, and the server
