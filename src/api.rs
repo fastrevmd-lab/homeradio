@@ -875,9 +875,16 @@ async fn sse_handler(
             .event("state")
             .data(serde_json::to_string(&state).unwrap()))
     });
-    // A lagging receiver drops events; clients refetch /api/stations on reconnect.
-    let stations_events = BroadcastStream::new(state.stations_tx.subscribe())
-        .filter_map(|message| message.ok())
+    // Subscribe before taking the snapshot so no change falls between them. The
+    // snapshot is the first `stations` event of every connection: a change made
+    // after the page's GET /api/stations but before this subscription would
+    // otherwise be missed. A lagging receiver drops events; clients refetch
+    // /api/stations on reconnect, and ignore any snapshot older than the one
+    // they show (by `revision`).
+    let stations_rx = state.stations_tx.subscribe();
+    let snapshot = serde_json::to_string(&state.stations.read().await.registry_view()).unwrap();
+    let stations_events = tokio_stream::once(snapshot)
+        .chain(BroadcastStream::new(stations_rx).filter_map(|message| message.ok()))
         .map(|json| Ok(Event::default().event("stations").data(json)));
 
     Sse::new(state_events.merge(stations_events)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))

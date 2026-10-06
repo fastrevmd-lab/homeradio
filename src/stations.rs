@@ -62,7 +62,18 @@ pub struct GroupView {
 /// The `Stations` API shape: the ROCK and CLIAMP groups plus the `my` group.
 #[derive(Debug, Clone, Serialize)]
 pub struct RegistryView {
+    /// Rises on every MY or CLIAMP change, so a client can discard a snapshot
+    /// older than the one it already shows. Starts from the wall clock, so a
+    /// restarted server is never behind a page that outlived the old one.
+    pub revision: u64,
     pub groups: Vec<GroupView>,
+}
+
+/// Where a new manager's revision counter starts: milliseconds since the epoch.
+fn initial_revision() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +109,8 @@ pub struct StationManager {
     /// The Radio Browser station that is playing now, kept so the LCD name
     /// survives the search cache expiring (or the station leaving MY) mid-listen.
     playing_rb: Option<StoredRbStation>,
+    /// Bumped on every change to what `registry_view` shows; see `RegistryView`.
+    revision: u64,
 }
 
 impl StationManager {
@@ -127,6 +140,7 @@ impl StationManager {
             my,
             search_cache: SearchCache::new(),
             playing_rb: None,
+            revision: initial_revision(),
         };
 
         manager.rebuild_url_map();
@@ -296,12 +310,20 @@ impl StationManager {
 
     /// Adds an entry to MY; `Ok(false)` when it was already there.
     pub async fn my_add(&mut self, entry: MyEntry) -> Result<bool, MyError> {
-        self.my.add(entry).await
+        let changed = self.my.add(entry).await?;
+        if changed {
+            self.revision += 1;
+        }
+        Ok(changed)
     }
 
     /// Removes an entry from MY; `Ok(false)` when it was not there.
     pub async fn my_remove(&mut self, id: &str) -> Result<bool, MyError> {
-        self.my.remove(id).await
+        let changed = self.my.remove(id).await?;
+        if changed {
+            self.revision += 1;
+        }
+        Ok(changed)
     }
 
     /// Remembers search results so they can be played or kept by id.
@@ -371,7 +393,7 @@ impl StationManager {
             label: "MY".to_string(),
             stations: my_stations,
         });
-        RegistryView { groups }
+        RegistryView { revision: self.revision, groups }
     }
 
     /// Start background refresh task
@@ -393,6 +415,7 @@ impl StationManager {
                 let mut mgr = manager.write().await;
                 mgr.cliamp_stations = stations;
                 mgr.rebuild_url_map();
+                mgr.revision += 1;
             }
         });
     }
@@ -460,6 +483,7 @@ mod tests {
             my: MyStore::load(PathBuf::from("/nonexistent/my-stations.json")),
             search_cache: SearchCache::new(),
             playing_rb: None,
+            revision: 0,
         };
 
         manager.rebuild_url_map();
@@ -507,6 +531,7 @@ mod tests {
             my: MyStore::load(dir.join("my-stations.json")),
             search_cache: SearchCache::new(),
             playing_rb: None,
+            revision: initial_revision(),
         };
         manager.rebuild_url_map();
         manager
@@ -526,6 +551,35 @@ mod tests {
         assert_eq!(group(&view, "my").label, "MY");
         assert!(group(&view, "my").stations.is_empty());
         assert!(!group(&view, "rock").stations[0].in_my);
+    }
+
+    #[tokio::test]
+    async fn the_revision_rises_on_every_real_my_change_and_only_then() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let initial = manager.registry_view().revision;
+
+        manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
+        let after_add = manager.registry_view().revision;
+        assert!(after_add > initial);
+
+        manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
+        assert_eq!(manager.registry_view().revision, after_add, "a no-op add changes nothing");
+
+        manager.my_remove("lofi").await.unwrap();
+        assert!(manager.registry_view().revision > after_add);
+
+        let json = serde_json::to_value(manager.registry_view()).unwrap();
+        assert!(json["revision"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn a_new_manager_starts_above_the_revision_of_an_earlier_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = manager_in(dir.path()).registry_view().revision;
+        std::thread::sleep(Duration::from_millis(5));
+        let later = manager_in(dir.path()).registry_view().revision;
+        assert!(later > earlier, "a restarted server must not look older than the page's last snapshot");
     }
 
     #[tokio::test]

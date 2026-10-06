@@ -2584,7 +2584,9 @@ async fn my_changes_are_pushed_as_a_stations_event() {
         axum::serve(listener, api::create_router(state)).await.unwrap();
     });
     let mut events = reqwest::get(format!("http://{address}/api/events")).await.unwrap();
-    read_sse_until(&mut events, "event: state").await;
+    // The connection opens with a snapshot (MY still empty, so nothing is in_my).
+    let snapshot = read_sse_until(&mut events, "event: stations").await;
+    assert!(!snapshot.contains(r#""in_my":true"#), "{snapshot:?}");
 
     reqwest::Client::new()
         .post(format!("http://{address}/api/my"))
@@ -2593,9 +2595,44 @@ async fn my_changes_are_pushed_as_a_stations_event() {
         .await
         .unwrap();
 
-    let received = read_sse_until(&mut events, "event: stations").await;
+    let received = read_sse_until(&mut events, r#""in_my":true"#).await;
     assert!(received.contains(r#""id":"my""#), "{received:?}");
+}
+
+#[tokio::test]
+async fn every_sse_connection_starts_with_a_stations_snapshot() {
+    let app = discovery_app().await;
+    // A change made before any browser subscribes: only the snapshot can carry it.
+    app.server.post("/api/my").json(&json!({"station": "test"})).await.assert_status_ok();
+    let state = app.state.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, api::create_router(state)).await.unwrap();
+    });
+
+    let mut events = reqwest::get(format!("http://{address}/api/events")).await.unwrap();
+    let received = read_sse_until(&mut events, "event: stations").await;
+
+    assert!(received.contains(r#""id":"my""#), "{received:?}");
+    assert!(received.contains(r#""revision":"#), "{received:?}");
     assert!(received.contains(r#""in_my":true"#), "{received:?}");
+}
+
+#[tokio::test]
+async fn the_stations_revision_rises_on_add_and_remove_over_http() {
+    let app = discovery_app().await;
+    let revision = |body: &serde_json::Value| body["revision"].as_u64().expect("revision is a number");
+    let initial = revision(&app.server.get("/api/stations").await.json());
+
+    let added: serde_json::Value = app.server.post("/api/my").json(&json!({"station": "test"})).await.json();
+    assert!(revision(&added) > initial);
+    let repeated: serde_json::Value = app.server.post("/api/my").json(&json!({"station": "test"})).await.json();
+    assert_eq!(revision(&repeated), revision(&added));
+    let removed: serde_json::Value = app.server.delete("/api/my/test").await.json();
+    assert!(revision(&removed) > revision(&added));
+    let fetched: serde_json::Value = app.server.get("/api/stations").await.json();
+    assert_eq!(revision(&fetched), revision(&removed));
 }
 
 // ---- Station discovery: playing rb- ids ----
