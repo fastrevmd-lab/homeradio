@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::time::Duration;
 
 /// Results returned to the caller after filtering.
 pub const SEARCH_LIMIT: usize = 30;
@@ -191,6 +192,132 @@ pub fn filter_stations(raw: Vec<RawStation>, limit: usize) -> Vec<RbStation> {
     stations
 }
 
+const ALL_SERVERS_BASE: &str = "https://all.api.radio-browser.info";
+const FALLBACK_BASE: &str = "https://de1.api.radio-browser.info";
+/// Results fetched before filtering; `SEARCH_LIMIT` survive.
+const FETCH_LIMIT: &str = "60";
+/// Per-request timeout.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The `GET /json/stations/search` URL for a name and/or tag search.
+pub(crate) fn search_url(
+    base: &str,
+    name: Option<&str>,
+    tag: Option<&str>,
+) -> Result<reqwest::Url, RbError> {
+    let mut params: Vec<(&str, &str)> = Vec::new();
+    if let Some(name) = name {
+        params.push(("name", name));
+    }
+    if let Some(tag) = tag {
+        params.push(("tag", tag));
+    }
+    params.extend([
+        ("limit", FETCH_LIMIT),
+        ("hidebroken", "true"),
+        ("order", "clickcount"),
+        ("reverse", "true"),
+    ]);
+    reqwest::Url::parse_with_params(&format!("{base}/json/stations/search"), &params)
+        .map_err(|error| RbError::Unavailable(error.to_string()))
+}
+
+/// The `GET /json/stations/byuuid/<uuid>` URL. The caller has validated `uuid`.
+pub(crate) fn by_uuid_url(base: &str, uuid: &str) -> String {
+    format!("{base}/json/stations/byuuid/{uuid}")
+}
+
+/// Host names from a `/json/servers` response, keeping only Radio Browser hosts.
+pub(crate) fn parse_server_names(entries: &[serde_json::Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| entry.get("name")?.as_str())
+        .filter(|name| name.ends_with(".radio-browser.info"))
+        .filter(|name| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Radio Browser over HTTPS, pinned to one mirror chosen at startup.
+pub struct HttpRadioBrowser {
+    client: reqwest::Client,
+    base: String,
+}
+
+impl HttpRadioBrowser {
+    /// Resolves `all.api.radio-browser.info` to one mirror (falling back to
+    /// `de1`) and builds the client. Never fails: if Radio Browser is down,
+    /// searches fail later and the rest of the app is unaffected.
+    pub async fn connect() -> Self {
+        let client = Self::build_client();
+        let base = match Self::pick_mirror(&client).await {
+            Some(host) => format!("https://{host}"),
+            None => FALLBACK_BASE.to_string(),
+        };
+        tracing::info!("Radio Browser mirror: {}", base);
+        Self { client, base }
+    }
+
+    /// Builds a client for a known base URL (used by tests and tools).
+    pub fn with_base(base: String) -> Self {
+        Self { client: Self::build_client(), base }
+    }
+
+    /// The shared client: 4 s timeout and the `User-Agent` Radio Browser asks for.
+    fn build_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(format!("homeradio/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("static client configuration is valid")
+    }
+
+    async fn pick_mirror(client: &reqwest::Client) -> Option<String> {
+        let url = format!("{ALL_SERVERS_BASE}/json/servers");
+        let response = client.get(url).send().await.ok()?.error_for_status().ok()?;
+        let entries: Vec<serde_json::Value> = response.json().await.ok()?;
+        let names = parse_server_names(&entries);
+        if names.is_empty() {
+            return None;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos() as usize)
+            .unwrap_or(0);
+        names.get(nanos % names.len()).cloned()
+    }
+
+    async fn get_entries(&self, url: reqwest::Url) -> Result<Vec<serde_json::Value>, RbError> {
+        let unavailable = |error: reqwest::Error| RbError::Unavailable(error.to_string());
+        let response = self.client.get(url).send().await.map_err(unavailable)?;
+        let response = response.error_for_status().map_err(unavailable)?;
+        response.json().await.map_err(unavailable)
+    }
+}
+
+#[async_trait]
+impl RadioBrowser for HttpRadioBrowser {
+    async fn search(
+        &self,
+        name: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<Vec<RbStation>, RbError> {
+        let url = search_url(&self.base, name, tag)?;
+        let entries = self.get_entries(url).await?;
+        Ok(filter_stations(parse_raw_stations(entries), SEARCH_LIMIT))
+    }
+
+    async fn by_uuid(&self, uuid: &str) -> Result<Option<RbStation>, RbError> {
+        if !is_valid_uuid(uuid) {
+            return Ok(None);
+        }
+        let url = reqwest::Url::parse(&by_uuid_url(&self.base, uuid))
+            .map_err(|error| RbError::Unavailable(error.to_string()))?;
+        let entries = self.get_entries(url).await?;
+        Ok(filter_stations(parse_raw_stations(entries), 1).into_iter().next())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +472,55 @@ mod tests {
     fn short_name_fits_a_preset_key() {
         assert_eq!(short_name("Jazz FM"), "Jazz FM");
         assert_eq!(short_name("Radio Paradise Main Mix"), "Radio Parad\u{2026}");
+    }
+
+    #[test]
+    fn search_url_encodes_and_omits_absent_parameters() {
+        let by_name = search_url("https://de1.api.radio-browser.info", Some("jazz & blues"), None).unwrap();
+        assert_eq!(
+            by_name.as_str(),
+            "https://de1.api.radio-browser.info/json/stations/search?name=jazz+%26+blues&limit=60&hidebroken=true&order=clickcount&reverse=true"
+        );
+        let by_tag = search_url("https://x.example", None, Some("classic rock")).unwrap();
+        assert!(by_tag.query().unwrap().starts_with("tag=classic+rock&limit=60"));
+        assert!(!by_tag.query().unwrap().contains("name="));
+        let both = search_url("https://x.example", Some("kiss"), Some("rock")).unwrap();
+        assert!(both.query().unwrap().starts_with("name=kiss&tag=rock&limit=60"));
+    }
+
+    #[test]
+    fn by_uuid_url_appends_the_uuid() {
+        assert_eq!(
+            by_uuid_url("https://x.example", UUID_A),
+            format!("https://x.example/json/stations/byuuid/{UUID_A}")
+        );
+    }
+
+    #[test]
+    fn server_names_keep_only_radio_browser_hosts() {
+        let entries = vec![
+            json!({"ip": "1.2.3.4", "name": "de1.api.radio-browser.info"}),
+            json!({"ip": "5.6.7.8", "name": "evil.example.com"}),
+            json!({"ip": "9.9.9.9", "name": "a.radio-browser.info/../x"}),
+            json!({"ip": "9.9.9.9"}),
+            json!({"name": "fi1.api.radio-browser.info"}),
+        ];
+        assert_eq!(
+            parse_server_names(&entries),
+            vec!["de1.api.radio-browser.info".to_string(), "fi1.api.radio-browser.info".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn by_uuid_refuses_a_malformed_uuid_without_a_request() {
+        // Port 9 (discard) is never contacted: the uuid check returns first.
+        let browser = HttpRadioBrowser::with_base("http://127.0.0.1:9".to_string());
+        assert_eq!(browser.by_uuid("../etc/passwd").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_reported_as_unavailable() {
+        let browser = HttpRadioBrowser::with_base("http://127.0.0.1:9".to_string());
+        assert!(matches!(browser.search(Some("jazz"), None).await, Err(RbError::Unavailable(_))));
     }
 }
