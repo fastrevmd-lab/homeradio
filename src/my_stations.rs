@@ -87,13 +87,15 @@ pub struct MyStore {
 
 impl MyStore {
     /// Loads the list from `path`. A missing file is an empty list; a corrupt
-    /// one is logged and also loads as empty, never an error.
+    /// or unreadable one (including one that is not UTF-8) is preserved, logged
+    /// and also loads as empty, never an error.
     pub fn load(path: PathBuf) -> Self {
         let entries = match std::fs::read_to_string(&path) {
             Ok(contents) => Self::parse(&contents, &path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 warn!("Could not read {}: {}; starting with an empty MY list", path.display(), error);
+                Self::preserve_corrupt_file(&path);
                 Vec::new()
             }
         };
@@ -135,12 +137,21 @@ impl MyStore {
         entries
     }
 
+    /// Renames the unusable file at `path` to the first free `<name>.corrupt`,
+    /// `<name>.corrupt.1`, `<name>.corrupt.2`, ... so an earlier preserved copy
+    /// is never overwritten.
     fn preserve_corrupt_file(path: &Path) {
         let file_name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "my-stations.json".to_string());
-        let corrupt_path = path.with_file_name(format!("{file_name}.corrupt"));
+        let corrupt_path = (0u32..)
+            .map(|attempt| match attempt {
+                0 => path.with_file_name(format!("{file_name}.corrupt")),
+                _ => path.with_file_name(format!("{file_name}.corrupt.{attempt}")),
+            })
+            .find(|candidate| std::fs::symlink_metadata(candidate).is_err())
+            .expect("an unbounded range always yields a free name");
         match std::fs::rename(path, &corrupt_path) {
             Ok(()) => warn!("Moved the corrupt MY file to {}", corrupt_path.display()),
             Err(error) => warn!("Could not preserve the corrupt MY file: {}", error),
@@ -392,6 +403,33 @@ mod tests {
             "{ this is not json"
         );
         assert_eq!(store_in(&dir).entries(), &[reference("big100")]);
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_file_is_preserved_so_the_next_save_cannot_destroy_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let latin1_bytes: &[u8] = b"[{\"ref\": \"caf\xe9\"}]";
+        std::fs::write(dir.path().join("my-stations.json"), latin1_bytes).unwrap();
+        let mut store = store_in(&dir);
+        assert!(store.entries().is_empty());
+        assert_eq!(std::fs::read(dir.path().join("my-stations.json.corrupt")).unwrap(), latin1_bytes);
+        store.add(reference("big100")).await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("my-stations.json.corrupt")).unwrap(), latin1_bytes);
+        assert_eq!(store_in(&dir).entries(), &[reference("big100")]);
+    }
+
+    #[test]
+    fn a_second_corruption_does_not_overwrite_the_first_preserved_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("my-stations.json");
+        for (round, contents) in ["first {", "second {", "third {"].into_iter().enumerate() {
+            std::fs::write(&live_path, contents).unwrap();
+            assert!(store_in(&dir).entries().is_empty(), "round {round}");
+        }
+        let preserved = |suffix: &str| std::fs::read_to_string(dir.path().join(format!("my-stations.json{suffix}"))).unwrap();
+        assert_eq!(preserved(".corrupt"), "first {");
+        assert_eq!(preserved(".corrupt.1"), "second {");
+        assert_eq!(preserved(".corrupt.2"), "third {");
     }
 
     #[tokio::test]
