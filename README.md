@@ -6,7 +6,7 @@
 An 80s boom box in the browser that plays internet radio through a Yamaha
 receiver, in one room, another room, or both. Anyone on the LAN can use it.
 
-<!-- screenshot: docs/screenshot.png -->
+<p align="center"><img src="docs/screenshot-2026-10-06_12-44-35.png" alt="homeradio: the boom box UI with spectrum analyser, tuning dial, presets and two zone controls" width="760"></p>
 
 - **Two zones.** A MEDIA ROOM / UPSTAIRS (receiver main + zone2) on-off switch and a
   volume knob per room, 7 ROCK presets, a tuning dial over all stations with a
