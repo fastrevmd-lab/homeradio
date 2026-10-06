@@ -5,6 +5,7 @@ pub mod my_stations;
 pub mod policy;
 pub mod radiobrowser;
 pub mod route;
+pub mod search_cache;
 pub mod stations;
 pub mod state;
 pub mod title;
