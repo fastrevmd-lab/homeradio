@@ -67,6 +67,17 @@ Network inputs are `airplay`, `net_radio`, `server`, `spotify`, `pandora`,
 `siriusxm`, `napster`, `mc_link`, `bluetooth` and `usb`. Any other input counts as
 "someone's using it".
 
+## Command order
+
+`play`, `stop` and master `power` are numbered in the order their requests
+arrive, before any slow work (an uncached `rb-` id is looked up at Radio Browser
+first, which can take seconds). The most recently arrived command wins: if a
+command that arrived later has already taken effect when an older `play` reaches
+its turn, that play is **not** started and answers `200` with the current
+`State`. It is not an error: the request was overtaken, not refused, so a client
+just shows the state it gets back. Two quick plays still both run, in arrival
+order, so the second station is the one that ends up playing.
+
 ## Endpoints
 
 All responses are JSON. Errors are `{ "error": "<code>", "detail": "<human message>" }`.
@@ -81,10 +92,10 @@ Volume and mute calls for a zone in standby are refused with **409**
 |---|---|---|---|
 | GET  | `/api/state` | – | `State` |
 | GET  | `/api/stations` | – | `Stations` |
-| GET  | `/api/search?q=jazz&genre=Jazz` | – | `Search`. Needs `q` (trimmed, at least 2 characters, longer text is cut to 80) or `genre` (a chip name, case-insensitive), else 400 `bad_query`. A `q` shorter than 2 characters is ignored, so it is an error only when there is no `genre` either. Radio Browser unreachable → 503 `search_unavailable` |
+| GET  | `/api/search?q=jazz&genre=Jazz` | – | `Search`. Needs `q` (trimmed, at least 2 characters, longer text is cut to 80) or `genre` (a chip name, case-insensitive), else 400 `bad_query`. A `q` shorter than 2 characters is ignored, so it is an error only when there is no `genre` either. Radio Browser unreachable → 503 `search_unavailable`. An unknown `genre` is 400 `bad_query` even when a valid `q` is present |
 | POST | `/api/my` | `{"station":"rb-<uuid>"}` | `Stations`. Adds a station to MY (a no-op if already there). Also accepts a ROCK or CLIAMP id. Unknown id → 400 `unknown_station`, malformed `rb-` id → 400 `bad_station`, 51st entry → 409 `my_full`, Radio Browser unreachable → 503 `search_unavailable`, disk write failed → 500 `my_save_failed` |
-| DELETE | `/api/my/{id}` | – | `Stations`. Removes a station from MY (a no-op if it is not there) |
-| POST | `/api/play` | `{"station":"big100","zones":{"main":false,"zone2":true}}`. `zones` is optional. | `State`. Also accepts `rb-<uuid>` ids. Unknown id → 400 `unknown_station`, malformed `rb-` id → 400 `bad_station`, Radio Browser unreachable → 503 `search_unavailable`. No zone → 409 |
+| DELETE | `/api/my/{id}` | – | `Stations`. Removes a station from MY (a no-op if it is not there). Disk write failed → 500 `my_save_failed` |
+| POST | `/api/play` | `{"station":"big100","zones":{"main":false,"zone2":true}}`. `zones` is optional. | `State`. Also accepts `rb-<uuid>` ids. Unknown id → 400 `unknown_station`, malformed `rb-` id → 400 `bad_station`, Radio Browser unreachable → 503 `search_unavailable`. No zone → 409. A play overtaken by a stop, a power call or a newer play that arrived after it is not started: it answers 200 with the current `State` (see "Command order") |
 | POST | `/api/stop` | – | `State`. Stops cliamp only and leaves the zones alone |
 | POST | `/api/power` | `{"on":bool}` | `State`. Master switch. Off stops the radio and puts **both** zones in standby, including a TV on hdmi1. On wakes `main` only and leaves input, volume and selection alone |
 | POST | `/api/zone/{main\|zone2}/power` | `{"on":bool}` | `State` (toggle semantics above) |
@@ -142,14 +153,22 @@ When the receiver is unreachable, `zones` is `null`.
 
 ```json
 {
+  "revision": 1791317014245,
   "groups": [
     { "id": "rock",   "label": "ROCK",
-      "stations": [ { "id": "big100", "name": "BIG 100.3 – DC Classic Rock (WBIG)", "short": "BIG 100", "genre": "Classic Rock" } ] },
+      "stations": [ { "id": "big100", "name": "BIG 100.3 – DC Classic Rock (WBIG)", "short": "BIG 100", "genre": "Classic Rock", "in_my": false } ] },
     { "id": "cliamp", "label": "CLIAMP",
-      "stations": [ { "id": "lofi", "name": "Lofi", "short": "Lofi", "genre": "Lofi" } ] }
+      "stations": [ { "id": "lofi", "name": "Lofi", "short": "Lofi", "genre": "Lofi", "in_my": false } ] }
   ]
 }
 ```
+
+`revision` rises on every change to what the payload shows (a MY add or remove,
+a CLIAMP refresh); a no-op add or remove leaves it alone. It starts from the
+server's wall clock (milliseconds), so a restarted server never looks older than
+a page that outlived the old one. A client keeps the highest `revision` it has
+shown and ignores any snapshot with a lower one, because snapshots arrive from
+several places (responses, SSE, refetches) and can arrive out of order.
 
 Each station also carries `in_my`. A third group, `my`, is the household's
 shared list (label `MY`, insertion order, at most 50 entries). It can hold
@@ -184,10 +203,12 @@ Oldies, Classical, Lofi, News, Talk.
 
 - **Updates.** Each state change is sent as `event: state` with `data: <State JSON>`.
   The first event goes out immediately on connect.
-- **MY changes.** After every change to MY, an `event: stations` is sent with
-  `data: <Stations JSON>`, so other open browsers refresh their MY band. A
-  no-op add or remove sends nothing. A client that lags may miss one, so refetch
-  `/api/stations` on reconnect.
+- **Stations.** Every connection starts with an `event: stations` carrying the
+  current `Stations` JSON (right after the first `state`), so a change made
+  between a page's `GET /api/stations` and its subscription is not lost. After
+  every change to MY, another is sent with `data: <Stations JSON>`, so other
+  open browsers refresh their MY band. A no-op add or remove sends nothing. A
+  client that lags may miss one, so refetch `/api/stations` on reconnect.
 - **Keepalive.** A `: ping` comment is sent every 15 s.
 - **Sources.** Changes come from these places:
   - `cliamp remote events runtime.state`, an NDJSON child process that is restarted
