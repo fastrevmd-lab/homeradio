@@ -28,6 +28,15 @@ const elements = {
     bandSwitch: document.getElementById('bandSwitch'),
     bandOptions: Array.from(document.querySelectorAll('.band-option')),
     lcdStar: document.getElementById('lcdStar'),
+    boombox: document.querySelector('.boombox'),
+    searchBtn: document.getElementById('searchBtn'),
+    searchBackdrop: document.getElementById('searchBackdrop'),
+    searchDrawer: document.getElementById('searchDrawer'),
+    searchClose: document.getElementById('searchClose'),
+    searchInput: document.getElementById('searchInput'),
+    searchChips: document.getElementById('searchChips'),
+    searchStatus: document.getElementById('searchStatus'),
+    searchResults: document.getElementById('searchResults'),
     presetButtons: document.getElementById('presetButtons'),
     playBtn: document.getElementById('playBtn'),
     stopBtn: document.getElementById('stopBtn'),
@@ -967,6 +976,9 @@ function setupEventListeners() {
     // Dial control
     setupDialControl();
 
+    // Search drawer
+    setupSearch();
+
     // Volume knobs
     setupVolumeKnob('main', elements.mainKnob);
     setupVolumeKnob('zone2', elements.zone2Knob);
@@ -975,6 +987,68 @@ function setupEventListeners() {
     window.addEventListener('resize', debounce(() => { refreshDial(); resizeVisCanvas(); }, 250));
     if (typeof ResizeObserver === 'function') new ResizeObserver(debounce(resizeVisCanvas, 100)).observe(elements.visCanvas);
     resizeVisCanvas();
+}
+
+// ---------------------------------------------------------------------------
+// Search drawer: open/close, focus handling
+// ---------------------------------------------------------------------------
+
+/** @returns {boolean} whether the search drawer is showing */
+function isSearchOpen() {
+    return !elements.searchDrawer.hidden;
+}
+
+/** Show the drawer, make the boom box inert behind it and focus the search box. */
+function openSearch() {
+    if (isSearchOpen()) return;
+    elements.searchDrawer.hidden = false;
+    elements.searchBackdrop.hidden = false;
+    elements.boombox.inert = true;
+    elements.searchBtn.setAttribute('aria-expanded', 'true');
+    elements.searchInput.focus();
+}
+
+/** Hide the drawer and hand focus back to the 🔍 button. */
+function closeSearch() {
+    if (!isSearchOpen()) return;
+    elements.searchDrawer.hidden = true;
+    elements.searchBackdrop.hidden = true;
+    elements.boombox.inert = false;
+    elements.searchBtn.setAttribute('aria-expanded', 'false');
+    elements.searchBtn.focus();
+}
+
+/** Keep Tab and Shift+Tab inside the open drawer. */
+function trapSearchFocus(event) {
+    const focusable = Array.from(
+        elements.searchDrawer.querySelectorAll('button:not(:disabled), input:not(:disabled)')
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+    }
+}
+
+/** Wire the drawer: 🔍 opens it; Escape, the close button or the backdrop close it. */
+function setupSearch() {
+    elements.searchBtn.addEventListener('click', openSearch);
+    elements.searchClose.addEventListener('click', closeSearch);
+    elements.searchBackdrop.addEventListener('click', closeSearch);
+    document.addEventListener('keydown', (event) => {
+        if (!isSearchOpen()) return;
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            closeSearch();
+        } else if (event.key === 'Tab') {
+            trapSearchFocus(event);
+        }
+    });
 }
 
 // Dial control setup

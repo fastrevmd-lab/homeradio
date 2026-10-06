@@ -830,7 +830,9 @@ body::before {
 /* Band switch */
 .band-switch-container {
     display: flex;
+    align-items: center;
     justify-content: center;
+    gap: 10px;
 }
 
 .band-switch {
@@ -897,6 +899,27 @@ body::before {
 .band-option:focus-visible {
     outline: 3px solid var(--focus);
     outline-offset: 2px;
+}
+
+/* Search button beside the band switch: a small round metal key */
+.search-btn {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid #323a47;
+    background: linear-gradient(to bottom, #2b313c, #1a1e27);
+    box-shadow: 0 2px 0 #07090d, inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.search-btn:hover { border-color: var(--teal-dim); }
+.search-btn:active { transform: translateY(1px); }
+.search-btn:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 3px;
 }
 
 /* Preset buttons: dark metal keys, teal-lit when selected */
@@ -1345,4 +1368,116 @@ body::before {
     .preset-buttons { grid-template-columns: repeat(7, 1fr); }
     .volume-knob { width: 76px; height: 76px; }
     .knob-indicator { height: 26px; transform-origin: 50% 29px; }
+}
+
+/* Search drawer. It sits at body level, outside .control-panel (which has its own
+   stacking context), so it can cover the whole boom box. */
+.search-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: rgba(0, 0, 0, 0.55);
+}
+
+.search-drawer {
+    position: fixed;
+    z-index: 41;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 16px 16px;
+    color: var(--text-1);
+    border: 1px solid var(--border);
+    background: linear-gradient(to bottom, #1a1e27, #12151c);
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.6);
+    /* phones: a bottom sheet */
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-height: 80dvh;
+    border-radius: 14px 14px 0 0;
+}
+
+/* display: flex above would beat the hidden attribute */
+.search-drawer[hidden],
+.search-backdrop[hidden] {
+    display: none;
+}
+
+.search-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.search-title {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--teal);
+}
+
+.search-close {
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--ink-0);
+    color: var(--text-2);
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.search-close:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
+}
+
+.search-input {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--ink-0);
+    color: var(--text-1);
+    font-family: var(--sans);
+    font-size: 16px; /* 16px stops iOS zooming the page on focus */
+}
+
+.search-input:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .search-drawer { animation: drawer-up 0.22s ease-out; }
+}
+
+@keyframes drawer-up {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+}
+
+@keyframes drawer-in {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+}
+
+/* Desktop: a side panel */
+@media (min-width: 901px) {
+    .search-drawer {
+        left: auto;
+        top: 0;
+        width: 400px;
+        max-height: none;
+        border-radius: 0;
+        box-shadow: -8px 0 30px rgba(0, 0, 0, 0.6);
+    }
+}
+
+@media (min-width: 901px) and (prefers-reduced-motion: no-preference) {
+    .search-drawer { animation: drawer-in 0.22s ease-out; }
 }

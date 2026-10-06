@@ -98,6 +98,7 @@
                             <button type="button" class="band-option" role="radio" aria-checked="false" data-band="my" tabindex="-1">MY</button>
                         </div>
                     </div>
+                    <button type="button" class="search-btn" id="searchBtn" aria-label="Search stations" aria-haspopup="dialog" aria-expanded="false">&#128269;</button>
                 </div>
 
                 <!-- Preset buttons (first 7 stations of the selected band) -->
@@ -183,6 +184,19 @@
             </div>
         </div>
     </div>
+
+    <!-- Station search: a bottom sheet on phones, a side panel on desktop -->
+    <div class="search-backdrop" id="searchBackdrop" hidden></div>
+    <section class="search-drawer" id="searchDrawer" role="dialog" aria-modal="true" aria-labelledby="searchTitle" hidden>
+        <header class="search-head">
+            <h2 class="search-title" id="searchTitle">Find stations</h2>
+            <button type="button" class="search-close" id="searchClose" aria-label="Close search">&times;</button>
+        </header>
+        <input type="search" class="search-input" id="searchInput" placeholder="Search by name" aria-label="Search stations by name" maxlength="80" autocomplete="off" spellcheck="false">
+        <div class="search-chips" id="searchChips" role="group" aria-label="Genres"></div>
+        <p class="search-status" id="searchStatus" role="status" aria-live="polite"></p>
+        <ul class="search-results" id="searchResults"></ul>
+    </section>
 
     <script src="app.js"></script>
 </body>
