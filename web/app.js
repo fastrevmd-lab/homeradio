@@ -188,6 +188,7 @@ function applyStations(data) {
     renderPresetButtons();
     refreshDial();
     renderStar();
+    refreshSearchStars();
 }
 
 /** @returns {boolean} whether the station is in the MY list */
@@ -1035,8 +1036,143 @@ function trapSearchFocus(event) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Search drawer: genre chips, debounced search, result rows
+//
+// Everything Radio Browser sends us is untrusted text, so rows are built with
+// createElement and textContent only, never HTML strings.
+// ---------------------------------------------------------------------------
+const SEARCH_GENRES = ['Rock', 'Classic Rock', 'Alt', 'Jazz', 'Blues', 'Country', 'Oldies', 'Classical', 'Lofi', 'News', 'Talk'];
+const SEARCH_MIN_CHARS = 2;
+const SEARCH_DEBOUNCE_MS = 300;
+const SEARCH_IDLE_HINT = 'Type a name or pick a genre.';
+let searchGenre = null; // the selected chip, or null
+let searchRequestId = 0; // a response only counts while its request is the latest
+
+/** Show one line of status text under the chips (empty clears it). */
+function setSearchStatus(text) {
+    elements.searchStatus.textContent = text;
+}
+
+/** Build the genre chips: tapping one selects it, tapping it again clears it. */
+function buildGenreChips() {
+    const chips = SEARCH_GENRES.map((genre) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'search-chip';
+        chip.textContent = genre;
+        chip.setAttribute('aria-pressed', 'false');
+        chip.addEventListener('click', () => {
+            searchGenre = searchGenre === genre ? null : genre;
+            for (const other of elements.searchChips.children) {
+                other.setAttribute('aria-pressed', String(other.textContent === searchGenre));
+            }
+            runSearch();
+        });
+        return chip;
+    });
+    elements.searchChips.replaceChildren(...chips);
+}
+
+/**
+ * One result row: name, a "genre · country · bitrate" line, then ▶ and ★.
+ * @param {{id: string, name: string, genre: string, country: string, bitrate: number}} result
+ * @returns {HTMLLIElement}
+ */
+function createResultRow(result) {
+    const row = document.createElement('li');
+    row.className = 'search-row';
+
+    const info = document.createElement('div');
+    info.className = 'search-info';
+    const name = document.createElement('span');
+    name.className = 'search-name';
+    name.textContent = result.name;
+    const meta = document.createElement('span');
+    meta.className = 'search-meta';
+    meta.textContent = [result.genre, result.country, result.bitrate ? `${result.bitrate} kbps` : '']
+        .filter(Boolean).join(' · ');
+    info.append(name, meta);
+
+    const play = document.createElement('button');
+    play.type = 'button';
+    play.className = 'search-play';
+    play.textContent = '▶';
+    play.setAttribute('aria-label', `Play ${result.name}`);
+    play.addEventListener('click', () => playStation(result.id));
+
+    const star = document.createElement('button');
+    star.type = 'button';
+    star.className = 'search-star';
+    star.textContent = '★';
+    star.dataset.id = result.id;
+    star.setAttribute('aria-label', `Keep ${result.name} in MY`);
+    star.addEventListener('click', () => toggleMy(result.id, isInMy(result.id)));
+
+    row.append(info, play, star);
+    return row;
+}
+
+/** Repaint each result's ★ from the MY list, in place so keyboard focus stays put. */
+function refreshSearchStars() {
+    for (const star of elements.searchResults.querySelectorAll('.search-star')) {
+        star.setAttribute('aria-pressed', String(isInMy(star.dataset.id)));
+    }
+}
+
+/** Replace the result list. */
+function renderSearchResults(results) {
+    elements.searchResults.replaceChildren(...results.map(createResultRow));
+    refreshSearchStars();
+}
+
+/** Run the search for the box text and the selected chip, and show the outcome. */
+async function runSearch() {
+    const requestId = ++searchRequestId;
+    const query = elements.searchInput.value.trim();
+    const useQuery = query.length >= SEARCH_MIN_CHARS;
+    if (!useQuery && !searchGenre) {
+        elements.searchResults.removeAttribute('aria-busy');
+        renderSearchResults([]);
+        setSearchStatus(SEARCH_IDLE_HINT);
+        return;
+    }
+
+    const params = new URLSearchParams();
+    if (useQuery) params.set('q', query);
+    if (searchGenre) params.set('genre', searchGenre);
+    setSearchStatus('Searching…');
+    elements.searchResults.setAttribute('aria-busy', 'true');
+
+    let results = null;
+    try {
+        const response = await fetch(`/api/search?${params}`);
+        if (response.ok) results = (await response.json()).results;
+    } catch (error) {
+        results = null;
+    }
+    if (requestId !== searchRequestId) return; // a newer search took over
+    elements.searchResults.removeAttribute('aria-busy');
+
+    if (!Array.isArray(results)) {
+        renderSearchResults([]);
+        setSearchStatus('Search unavailable');
+        return;
+    }
+    renderSearchResults(results);
+    setSearchStatus(results.length === 0 ? 'No stations found' : '');
+}
+
+const scheduleSearch = debounce(runSearch, SEARCH_DEBOUNCE_MS);
+
 /** Wire the drawer: 🔍 opens it; Escape, the close button or the backdrop close it. */
 function setupSearch() {
+    buildGenreChips();
+    setSearchStatus(SEARCH_IDLE_HINT);
+    elements.searchInput.addEventListener('input', () => {
+        searchRequestId++; // whatever is in flight is for text that is gone
+        scheduleSearch();
+    });
     elements.searchBtn.addEventListener('click', openSearch);
     elements.searchClose.addEventListener('click', closeSearch);
     elements.searchBackdrop.addEventListener('click', closeSearch);
