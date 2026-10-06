@@ -10,6 +10,8 @@ let isDraggingKnob = false;
 let activeKnob = null;
 let eventSource = null;
 let lastSeenStation = null; // band auto-follow only when this changes
+let lastPlayedId = null; // the star's target while nothing is playing
+let stationsStale = false; // the event stream dropped: refetch stations once it is back
 let pendingFollowStation = null; // station change that arrived mid-drag; applied on drag end
 let lcdHoldActive = false;  // an error message currently owns the LCD
 let lcdHoldTimer = null;
@@ -25,6 +27,7 @@ const elements = {
     dialControl: document.getElementById('dialControl'),
     bandSwitch: document.getElementById('bandSwitch'),
     bandOptions: Array.from(document.querySelectorAll('.band-option')),
+    lcdStar: document.getElementById('lcdStar'),
     presetButtons: document.getElementById('presetButtons'),
     playBtn: document.getElementById('playBtn'),
     stopBtn: document.getElementById('stopBtn'),
@@ -139,10 +142,70 @@ function setupEventSource() {
         updateUI(state);
     });
 
+    // Another browser changed MY: the event carries the whole Stations payload
+    eventSource.addEventListener('stations', (event) => {
+        applyStations(JSON.parse(event.data));
+    });
+
     eventSource.onerror = () => {
         showError('Connection lost, reconnecting...');
-        // EventSource will auto-reconnect
+        // EventSource will auto-reconnect; MY events missed meanwhile are refetched then
+        stationsStale = true;
     };
+
+    eventSource.onopen = () => {
+        if (!stationsStale) return;
+        stationsStale = false;
+        refetchStations();
+    };
+}
+
+/** Fetch the station registry again and repaint it (after a dropped event stream). */
+async function refetchStations() {
+    applyStations(await apiCall('GET', '/stations'));
+}
+
+/**
+ * Adopt a new Stations payload (from a MY change here or elsewhere) and repaint
+ * everything that depends on it, keeping the station the dial was on.
+ * @param {?{groups: Array}} data the Stations JSON, or null when a request failed
+ */
+function applyStations(data) {
+    if (!data || !Array.isArray(data.groups)) return;
+    const selectedId = getCurrentGroup()?.stations[selectedStationIndex]?.id;
+    stations = data;
+    const keptIndex = selectedId ? (getCurrentGroup()?.stations.findIndex(s => s.id === selectedId) ?? -1) : -1;
+    if (keptIndex !== -1) selectedStationIndex = keptIndex;
+    renderPresetButtons();
+    refreshDial();
+    renderStar();
+}
+
+/** @returns {boolean} whether the station is in the MY list */
+function isInMy(stationId) {
+    return stations.groups.find(g => g.id === 'my')?.stations.some(s => s.id === stationId) ?? false;
+}
+
+/** Add the station to MY, or remove it when it is already there. */
+async function toggleMy(stationId, isSaved) {
+    const data = isSaved
+        ? await apiCall('DELETE', `/my/${encodeURIComponent(stationId)}`)
+        : await apiCall('POST', '/my', { station: stationId });
+    applyStations(data);
+}
+
+/** @returns {?string} the station the LCD star acts on: the current one, else the last played */
+function starTargetId() {
+    return currentState?.player.station ?? lastPlayedId;
+}
+
+// Paint the LCD star: disabled with no station yet, filled when the station is in MY
+function renderStar() {
+    const targetId = starTargetId();
+    const isSaved = targetId ? isInMy(targetId) : false;
+    elements.lcdStar.disabled = !targetId;
+    elements.lcdStar.setAttribute('aria-pressed', String(isSaved));
+    elements.lcdStar.title = isSaved ? 'Remove from MY' : 'Keep in MY';
 }
 
 // Render the 7 preset keys for the current band using DOM APIs only (no HTML
@@ -300,8 +363,10 @@ function updateUI(state) {
         }
     }
 
-    // Preset button selection
+    // Preset button selection and the LCD star
     updatePresetSelection(stationId);
+    if (stationId) lastPlayedId = stationId;
+    renderStar();
 
     // Zones
     if (state.zones) {
@@ -868,6 +933,12 @@ function setupEventListeners() {
         event.preventDefault();
         const nextIndex = (BANDS.indexOf(currentBand) + step + BANDS.length) % BANDS.length;
         setBand(BANDS[nextIndex], { focus: true });
+    });
+
+    // LCD star: keep the current station in MY, or take it out again
+    elements.lcdStar.addEventListener('click', () => {
+        const targetId = starTargetId();
+        if (targetId) toggleMy(targetId, isInMy(targetId));
     });
 
     // Play button

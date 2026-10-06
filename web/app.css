@@ -496,6 +496,45 @@ body::before {
     display: flex;
     align-items: center;
     height: 100%;
+    min-width: 0;
+    margin-right: 30px; /* room for the star */
+    overflow: hidden;
+}
+
+/* The LCD's star: dim outline when the station is not in MY, lit when it is */
+.lcd-star {
+    position: absolute;
+    top: 50%;
+    right: 6px;
+    transform: translateY(-50%);
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: #052a28;
+    color: rgba(143, 245, 236, 0.35);
+    font-size: 17px;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 0.2s, text-shadow 0.2s;
+}
+
+.lcd-star[aria-pressed="true"] {
+    color: #8ff5ec;
+    text-shadow: 0 0 6px rgba(77, 208, 200, 0.7);
+}
+
+.lcd-star:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
+.lcd-star:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: -3px;
 }
 
 .lcd-text {
