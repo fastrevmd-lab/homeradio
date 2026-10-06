@@ -11,6 +11,7 @@ let activeKnob = null;
 let eventSource = null;
 let lastSeenStation = null; // band auto-follow only when this changes
 let lastPlayedId = null; // the star's target while nothing is playing
+let stationsRevision = 0; // revision of the Stations snapshot on screen; older ones are ignored
 let stationsStale = false; // the event stream dropped: refetch stations once it is back
 let pendingFollowStation = null; // station change that arrived mid-drag; applied on drag end
 let lcdHoldActive = false;  // an error message currently owns the LCD
@@ -102,15 +103,27 @@ async function apiCall(method, path, body = null) {
         const data = await response.json();
 
         if (!response.ok) {
-            showError(data.detail || data.error || 'Request failed');
+            showRequestError(data.detail || data.error || 'Request failed');
             return null;
         }
 
         return data;
     } catch (error) {
-        showError('Network error: ' + error.message);
+        showRequestError('Network error: ' + error.message);
         return null;
     }
+}
+
+/**
+ * Report a failed request. The LCD shows it, but the search drawer covers the
+ * LCD, so while the drawer is open the drawer's status line says it too.
+ * (Only request failures: the receiver's own error is re-sent on every state
+ * push and would keep overwriting the search status.)
+ * @param {string} message the error text
+ */
+function showRequestError(message) {
+    showError(message);
+    if (isSearchOpen()) setSearchStatus(message);
 }
 
 // Initialize
@@ -121,6 +134,7 @@ async function init() {
     const stationsData = await apiCall('GET', '/stations');
     if (stationsData) {
         stations = stationsData;
+        stationsRevision = stationsData.revision ?? 0;
         renderPresetButtons();
     }
     refreshDial();
@@ -164,23 +178,35 @@ function setupEventSource() {
 
     eventSource.onopen = () => {
         if (!stationsStale) return;
-        stationsStale = false;
         refetchStations();
     };
 }
 
-/** Fetch the station registry again and repaint it (after a dropped event stream). */
+/**
+ * Fetch the station registry again and repaint it (after a dropped event stream).
+ * The stale flag is cleared only once a refetch succeeded, so a failed one is
+ * retried on the next reconnect.
+ */
 async function refetchStations() {
-    applyStations(await apiCall('GET', '/stations'));
+    const data = await apiCall('GET', '/stations');
+    if (!data) return;
+    applyStations(data);
+    stationsStale = false;
 }
 
 /**
  * Adopt a new Stations payload (from a MY change here or elsewhere) and repaint
  * everything that depends on it, keeping the station the dial was on.
- * @param {?{groups: Array}} data the Stations JSON, or null when a request failed
+ * A snapshot older than the one already shown (by `revision`) is ignored, so
+ * out-of-order SSE events, responses and refetches cannot roll the UI back.
+ * @param {?{groups: Array, revision?: number}} data the Stations JSON, or null when a request failed
  */
 function applyStations(data) {
     if (!data || !Array.isArray(data.groups)) return;
+    if (typeof data.revision === 'number') {
+        if (data.revision < stationsRevision) return;
+        stationsRevision = data.revision;
+    }
     const selectedId = getCurrentGroup()?.stations[selectedStationIndex]?.id;
     stations = data;
     const keptIndex = selectedId ? (getCurrentGroup()?.stations.findIndex(s => s.id === selectedId) ?? -1) : -1;
@@ -215,7 +241,7 @@ function renderStar() {
     const isSaved = targetId ? isInMy(targetId) : false;
     elements.lcdStar.disabled = !targetId;
     elements.lcdStar.setAttribute('aria-pressed', String(isSaved));
-    elements.lcdStar.title = isSaved ? 'Remove from MY' : 'Keep in MY';
+    // The label stays constant; aria-pressed carries the state.
 }
 
 // Render the 7 preset keys for the current band using DOM APIs only (no HTML
@@ -934,10 +960,13 @@ function setupEventListeners() {
     // Band switch: an explicit choice sticks until the playing station changes
     elements.bandSwitch.addEventListener('click', (event) => {
         const option = event.target.closest('.band-option');
-        if (option) setBand(option.dataset.band);
+        // Re-clicking the current band must not reset the tuned dial
+        if (option && option.dataset.band !== currentBand) setBand(option.dataset.band);
     });
     // Radiogroup keys: arrows move to the neighbouring band, wrapping round
     elements.bandSwitch.addEventListener('keydown', (event) => {
+        // Alt/Ctrl/Meta+Arrow belongs to the browser (Back/Forward, word jumps)
+        if (event.altKey || event.ctrlKey || event.metaKey) return;
         const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[event.key];
         if (step === undefined) return;
         event.preventDefault();
