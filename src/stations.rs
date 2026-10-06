@@ -62,18 +62,27 @@ pub struct GroupView {
 /// The `Stations` API shape: the ROCK and CLIAMP groups plus the `my` group.
 #[derive(Debug, Clone, Serialize)]
 pub struct RegistryView {
-    /// Rises on every MY or CLIAMP change, so a client can discard a snapshot
-    /// older than the one it already shows. Starts from the wall clock, so a
-    /// restarted server is never behind a page that outlived the old one.
+    /// Identifies this server process: generated once at startup and different
+    /// on every boot. `revision` is only comparable within one `boot`, so a
+    /// client that sees a new `boot` accepts the snapshot whatever its revision.
+    pub boot: String,
+    /// Rises on every MY or CLIAMP change within one `boot` (it starts at 0 on
+    /// each boot), so a client can discard a snapshot older than the one it
+    /// already shows.
     pub revision: u64,
     pub groups: Vec<GroupView>,
 }
 
-/// Where a new manager's revision counter starts: milliseconds since the epoch.
-fn initial_revision() -> u64 {
-    std::time::SystemTime::now()
+/// A boot identifier that differs between processes and between managers in one
+/// process: startup time in nanoseconds, the process id and a per-process
+/// sequence number, in hex.
+fn new_boot_id() -> String {
+    static NEXT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let sequence = NEXT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos:x}-{:x}-{sequence:x}", std::process::id())
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +120,8 @@ pub struct StationManager {
     playing_rb: Option<StoredRbStation>,
     /// Bumped on every change to what `registry_view` shows; see `RegistryView`.
     revision: u64,
+    /// Generated once per manager; see `RegistryView`.
+    boot: String,
 }
 
 impl StationManager {
@@ -140,7 +151,8 @@ impl StationManager {
             my,
             search_cache: SearchCache::new(),
             playing_rb: None,
-            revision: initial_revision(),
+            revision: 0,
+            boot: new_boot_id(),
         };
 
         manager.rebuild_url_map();
@@ -393,7 +405,7 @@ impl StationManager {
             label: "MY".to_string(),
             stations: my_stations,
         });
-        RegistryView { revision: self.revision, groups }
+        RegistryView { boot: self.boot.clone(), revision: self.revision, groups }
     }
 
     /// Start background refresh task
@@ -484,6 +496,7 @@ mod tests {
             search_cache: SearchCache::new(),
             playing_rb: None,
             revision: 0,
+            boot: new_boot_id(),
         };
 
         manager.rebuild_url_map();
@@ -531,7 +544,8 @@ mod tests {
             my: MyStore::load(dir.join("my-stations.json")),
             search_cache: SearchCache::new(),
             playing_rb: None,
-            revision: initial_revision(),
+            revision: 0,
+            boot: new_boot_id(),
         };
         manager.rebuild_url_map();
         manager
@@ -574,12 +588,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_manager_starts_above_the_revision_of_an_earlier_run() {
+    async fn the_boot_id_is_present_and_stable_for_one_manager() {
         let dir = tempfile::tempdir().unwrap();
-        let earlier = manager_in(dir.path()).registry_view().revision;
-        std::thread::sleep(Duration::from_millis(5));
-        let later = manager_in(dir.path()).registry_view().revision;
-        assert!(later > earlier, "a restarted server must not look older than the page's last snapshot");
+        let mut manager = manager_in(dir.path());
+        let first = serde_json::to_value(manager.registry_view()).unwrap();
+        let boot = first["boot"].as_str().expect("boot is a string");
+        assert!(!boot.is_empty());
+
+        manager.my_add(MyEntry::Ref { station_id: "lofi".to_string() }).await.unwrap();
+        let second = serde_json::to_value(manager.registry_view()).unwrap();
+        assert_eq!(second["boot"], first["boot"], "a MY change does not start a new boot");
+        assert_eq!(first["revision"], 0, "the revision is a plain counter");
+    }
+
+    #[tokio::test]
+    async fn a_restarted_manager_has_a_different_boot_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = manager_in(dir.path()).registry_view().boot;
+        let later = manager_in(dir.path()).registry_view().boot;
+        assert_ne!(earlier, later, "a client must be able to tell the restart apart");
     }
 
     #[tokio::test]

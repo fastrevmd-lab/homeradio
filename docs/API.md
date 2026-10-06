@@ -153,7 +153,8 @@ When the receiver is unreachable, `zones` is `null`.
 
 ```json
 {
-  "revision": 1791317014245,
+  "boot": "18a4f3c2d5e1b7a0-1f4b-0",
+  "revision": 3,
   "groups": [
     { "id": "rock",   "label": "ROCK",
       "stations": [ { "id": "big100", "name": "BIG 100.3 – DC Classic Rock (WBIG)", "short": "BIG 100", "genre": "Classic Rock", "in_my": false } ] },
@@ -163,12 +164,15 @@ When the receiver is unreachable, `zones` is `null`.
 }
 ```
 
-`revision` rises on every change to what the payload shows (a MY add or remove,
-a CLIAMP refresh); a no-op add or remove leaves it alone. It starts from the
-server's wall clock (milliseconds), so a restarted server never looks older than
-a page that outlived the old one. A client keeps the highest `revision` it has
-shown and ignores any snapshot with a lower one, because snapshots arrive from
-several places (responses, SSE, refetches) and can arrive out of order.
+`boot` identifies the server process: it is generated once at startup and
+differs on every boot. `revision` rises on every change to what the payload
+shows (a MY add or remove, a CLIAMP refresh); a no-op add or remove leaves it
+alone. It is a plain counter that starts at 0 on each boot, so it is only
+comparable within one `boot`. A client keeps the `boot` and highest `revision`
+it has shown and ignores any snapshot of the same `boot` with a lower
+`revision`, because snapshots arrive from several places (responses, SSE,
+refetches) and can arrive out of order. A snapshot with a different `boot` (the
+server restarted) is always accepted and resets the remembered `revision`.
 
 Each station also carries `in_my`. A third group, `my`, is the household's
 shared list (label `MY`, insertion order, at most 50 entries). It can hold
