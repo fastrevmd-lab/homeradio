@@ -1,6 +1,7 @@
 pub mod api;
 pub mod cliamp;
 pub mod config;
+pub mod my_stations;
 pub mod policy;
 pub mod radiobrowser;
 pub mod route;
