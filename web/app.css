@@ -780,6 +780,14 @@ body::before {
     color: rgba(214, 252, 248, 0.7);
 }
 
+/* The empty MY band: a sentence, not a label */
+.dial-empty.dial-hint {
+    padding: 0 8px;
+    text-align: center;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+}
+
 /* Band switch */
 .band-switch-container {
     display: flex;
@@ -792,18 +800,11 @@ body::before {
     cursor: pointer;
 }
 
-.band-switch input {
-    position: absolute;
-    opacity: 0;
-    width: 0;
-    height: 0;
-}
-
 .band-switch-slider {
     position: relative;
     display: flex;
     align-items: center;
-    width: 200px;
+    width: 240px;
     padding: 6px;
     border-radius: 999px;
     border: 1px solid var(--border);
@@ -814,8 +815,8 @@ body::before {
 .band-switch-slider::before {
     content: '';
     position: absolute;
-    left: 5px;
-    width: calc(50% - 5px);
+    left: 6px;
+    width: calc((100% - 12px) / 3);
     height: calc(100% - 10px);
     border-radius: 999px;
     background: linear-gradient(to bottom, var(--teal), var(--teal-deep));
@@ -823,15 +824,24 @@ body::before {
     transition: transform 0.3s;
 }
 
-.band-switch input:checked ~ .band-switch-slider::before {
-    transform: translateX(calc(100% + 0px));
+.band-switch[data-band="cliamp"] .band-switch-slider::before {
+    transform: translateX(100%);
 }
 
-.band-label-left,
-.band-label-right {
+.band-switch[data-band="my"] .band-switch-slider::before {
+    transform: translateX(200%);
+}
+
+/* One segment of the three-way switch (a radio button in a radiogroup) */
+.band-option {
     position: relative;
     z-index: 2;
     flex: 1;
+    padding: 2px 0;
+    border: 0;
+    border-radius: 999px;
+    background: none;
+    cursor: inherit;
     text-align: center;
     font-family: var(--mono);
     font-size: 11px;
@@ -841,9 +851,13 @@ body::before {
     transition: color 0.3s;
 }
 
-.band-switch input:not(:checked) ~ .band-switch-slider .band-label-left,
-.band-switch input:checked ~ .band-switch-slider .band-label-right {
+.band-option[aria-checked="true"] {
     color: var(--ink-0);
+}
+
+.band-option:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
 }
 
 /* Preset buttons: dark metal keys, teal-lit when selected */
@@ -869,6 +883,8 @@ body::before {
 
 .preset-btn {
     position: relative;
+    min-width: 0;
+    overflow-wrap: anywhere;
     padding: 12px 6px 10px;
     border-radius: 6px;
     font-size: 11px;
@@ -876,6 +892,13 @@ body::before {
     letter-spacing: 0.03em;
     line-height: 1.2;
     text-align: center;
+}
+
+/* A band with fewer than 7 stations leaves blank, dead keys */
+.preset-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+    pointer-events: none;
 }
 
 /* indicator slit on every key */
@@ -1152,7 +1175,7 @@ body::before {
 .zone-toggle:active .toggle-slider::after,
 .preset-btn:focus-visible::after,
 .transport-btn:focus-visible::after,
-.band-switch input:focus-visible ~ .band-switch-slider::after,
+.band-switch:has(.band-option:focus-visible) .band-switch-slider::after,
 .zone-toggle input:focus-visible ~ .toggle-slider::after {
     opacity: 1;
 }
@@ -1199,7 +1222,6 @@ body::before {
     outline-offset: 3px;
 }
 
-.band-switch input:focus-visible ~ .band-switch-slider,
 .zone-toggle input:focus-visible ~ .toggle-slider {
     outline: 3px solid var(--focus);
     outline-offset: 3px;

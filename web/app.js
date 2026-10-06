@@ -2,6 +2,8 @@
 let stations = { groups: [] };
 let currentState = null;
 let currentBand = 'rock';
+const BANDS = ['rock', 'cliamp', 'my'];
+const PRESET_SLOTS = 7;
 let selectedStationIndex = 0;
 let isDraggingDial = false;
 let isDraggingKnob = false;
@@ -22,6 +24,7 @@ const elements = {
     dialScale: document.getElementById('dialScale'),
     dialControl: document.getElementById('dialControl'),
     bandSwitch: document.getElementById('bandSwitch'),
+    bandOptions: Array.from(document.querySelectorAll('.band-option')),
     presetButtons: document.getElementById('presetButtons'),
     playBtn: document.getElementById('playBtn'),
     stopBtn: document.getElementById('stopBtn'),
@@ -142,22 +145,30 @@ function setupEventSource() {
     };
 }
 
-// Render preset buttons (first 7 rock stations) using DOM APIs only (no HTML strings)
+// Render the 7 preset keys for the current band using DOM APIs only (no HTML
+// strings). A band with fewer than 7 stations leaves the extra keys blank and disabled.
 function renderPresetButtons() {
-    const rockGroup = stations.groups.find(g => g.id === 'rock');
-    if (!rockGroup) return;
+    const presetStations = (getCurrentGroup()?.stations ?? []).slice(0, PRESET_SLOTS);
 
-    const buttons = rockGroup.stations.slice(0, 7).map((station, index) => {
+    const buttons = Array.from({ length: PRESET_SLOTS }, (_, index) => {
+        const station = presetStations[index];
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'preset-btn';
-        button.dataset.station = station.id;
         button.dataset.index = String(index);
+        if (!station) {
+            button.disabled = true;
+            button.setAttribute('aria-label', 'Empty preset');
+            return button;
+        }
+        button.dataset.station = station.id;
         button.textContent = station.short;
+        button.title = station.name;
         button.addEventListener('click', () => playStation(station.id));
         return button;
     });
     elements.presetButtons.replaceChildren(...buttons);
+    updatePresetSelection(currentState?.player.station ?? null);
 }
 
 // Dial label layout (computed in renderDialScale, applied by updateDialLabels)
@@ -180,7 +191,9 @@ function renderDialScale() {
         dialLayout = null;
         const empty = document.createElement('div');
         empty.className = 'dial-empty';
-        empty.textContent = 'NO STATIONS';
+        const isEmptyMyBand = currentBand === 'my';
+        empty.classList.toggle('dial-hint', isEmptyMyBand);
+        empty.textContent = isEmptyMyBand ? '\u2605 a station to keep it here' : 'NO STATIONS';
         elements.dialScale.replaceChildren(empty);
         return;
     }
@@ -607,24 +620,59 @@ function refreshDial() {
     positionNeedle();
 }
 
-// Move the dial to a newly playing station, switching band if it lives in the other one
+/**
+ * Make `band` the current one and repaint the switch (thumb position, aria-checked,
+ * roving tabindex). Does not touch the presets or the dial.
+ * @param {string} band one of BANDS
+ * @param {boolean} [focus] move keyboard focus to the newly checked segment
+ */
+function paintBandSwitch(band, focus = false) {
+    currentBand = band;
+    elements.bandSwitch.dataset.band = band;
+    for (const option of elements.bandOptions) {
+        const isChecked = option.dataset.band === band;
+        option.setAttribute('aria-checked', String(isChecked));
+        option.tabIndex = isChecked ? 0 : -1;
+        if (isChecked && focus) option.focus();
+    }
+}
+
+/**
+ * Switch band by the user's choice: the presets and dial follow it, and the dial
+ * starts on the playing station when that station is in the band.
+ * @param {string} band one of BANDS
+ * @param {{focus?: boolean}} [options]
+ */
+function setBand(band, { focus = false } = {}) {
+    if (!BANDS.includes(band)) return;
+    paintBandSwitch(band, focus);
+    const playingId = currentState?.player.station;
+    const group = getCurrentGroup();
+    const playingIndex = playingId && group ? group.stations.findIndex(s => s.id === playingId) : -1;
+    selectedStationIndex = playingIndex === -1 ? 0 : playingIndex;
+    renderPresetButtons();
+    refreshDial();
+}
+
+// Move the dial to a newly playing station, switching band if it lives in another one.
+// The current band wins when the station is in several (a MY entry that is also a preset).
 function followStation(stationId) {
-    const inCurrent = getCurrentGroup()?.stations.findIndex(s => s.id === stationId) ?? -1;
-    if (inCurrent !== -1) {
-        selectedStationIndex = inCurrent;
-        positionNeedle();
+    const searchOrder = [currentBand, ...BANDS.filter(band => band !== currentBand)];
+    for (const band of searchOrder) {
+        const group = stations.groups.find(g => g.id === band);
+        const index = group ? group.stations.findIndex(s => s.id === stationId) : -1;
+        if (index === -1) continue;
+        if (band === currentBand) {
+            selectedStationIndex = index;
+            positionNeedle();
+            return;
+        }
+        paintBandSwitch(band);
+        renderPresetButtons();
+        selectedStationIndex = index;
+        refreshDial();
         return;
     }
-
-    const otherBand = currentBand === 'rock' ? 'cliamp' : 'rock';
-    const otherGroup = stations.groups.find(g => g.id === otherBand);
-    const inOther = otherGroup ? otherGroup.stations.findIndex(s => s.id === stationId) : -1;
-    if (inOther === -1) return;
-
-    currentBand = otherBand;
-    elements.bandSwitch.checked = otherBand === 'cliamp';
-    selectedStationIndex = inOther;
-    refreshDial();
 }
 
 // Update preset button selection
@@ -809,13 +857,17 @@ function showLoading() {
 // Event listeners
 function setupEventListeners() {
     // Band switch: an explicit choice sticks until the playing station changes
-    elements.bandSwitch.addEventListener('change', (e) => {
-        currentBand = e.target.checked ? 'cliamp' : 'rock';
-        const playingId = currentState?.player.station;
-        const group = getCurrentGroup();
-        const playingIndex = playingId && group ? group.stations.findIndex(s => s.id === playingId) : -1;
-        selectedStationIndex = playingIndex === -1 ? 0 : playingIndex;
-        refreshDial();
+    elements.bandSwitch.addEventListener('click', (event) => {
+        const option = event.target.closest('.band-option');
+        if (option) setBand(option.dataset.band);
+    });
+    // Radiogroup keys: arrows move to the neighbouring band, wrapping round
+    elements.bandSwitch.addEventListener('keydown', (event) => {
+        const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[event.key];
+        if (step === undefined) return;
+        event.preventDefault();
+        const nextIndex = (BANDS.indexOf(currentBand) + step + BANDS.length) % BANDS.length;
+        setBand(BANDS[nextIndex], { focus: true });
     });
 
     // Play button

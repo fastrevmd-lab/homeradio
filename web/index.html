@@ -89,16 +89,16 @@
 
                 <!-- Band switch -->
                 <div class="band-switch-container">
-                    <label class="band-switch">
-                        <input type="checkbox" id="bandSwitch" aria-label="Band selector">
-                        <span class="band-switch-slider">
-                            <span class="band-label-left">ROCK</span>
-                            <span class="band-label-right">CLIAMP</span>
-                        </span>
-                    </label>
+                    <div class="band-switch" id="bandSwitch" role="radiogroup" aria-label="Band selector" data-band="rock">
+                        <div class="band-switch-slider">
+                            <button type="button" class="band-option" role="radio" aria-checked="true" data-band="rock" tabindex="0">ROCK</button>
+                            <button type="button" class="band-option" role="radio" aria-checked="false" data-band="cliamp" tabindex="-1">CLIAMP</button>
+                            <button type="button" class="band-option" role="radio" aria-checked="false" data-band="my" tabindex="-1">MY</button>
+                        </div>
+                    </div>
                 </div>
 
-                <!-- Preset buttons (first 7 rock stations) -->
+                <!-- Preset buttons (first 7 stations of the selected band) -->
                 <div class="preset-buttons" id="presetButtons">
                     <!-- Populated by JS -->
                 </div>
