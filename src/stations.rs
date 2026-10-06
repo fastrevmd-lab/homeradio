@@ -1,4 +1,4 @@
-use crate::my_stations::{MyEntry, MyError, MyStore};
+use crate::my_stations::{MyEntry, MyError, MyStore, StoredRbStation};
 use crate::radiobrowser::RbStation;
 use crate::search_cache::SearchCache;
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,9 @@ pub struct StationManager {
     my: MyStore,
     /// Recent search results, so they can be played or kept by id.
     search_cache: SearchCache,
+    /// The Radio Browser station that is playing now, kept so the LCD name
+    /// survives the search cache expiring (or the station leaving MY) mid-listen.
+    playing_rb: Option<StoredRbStation>,
 }
 
 impl StationManager {
@@ -123,6 +126,7 @@ impl StationManager {
             remote_url,
             my,
             search_cache: SearchCache::new(),
+            playing_rb: None,
         };
 
         manager.rebuild_url_map();
@@ -243,12 +247,41 @@ impl StationManager {
         self.my.get_rb(id).map(|station| station.url.as_str())
     }
 
+    /// The display name for a station id, from the registry, MY, the station
+    /// playing now, or the search cache.
     pub fn get_station_name(&self, id: &str) -> Option<String> {
-        self.rock_stations
+        let curated = self
+            .rock_stations
             .iter()
             .chain(self.cliamp_stations.iter())
-            .find(|s| s.id == id)
-            .map(|s| s.name.clone())
+            .find(|s| s.id == id);
+        if let Some(station) = curated {
+            return Some(station.name.clone());
+        }
+        if let Some(stored) = self.my.get_rb(id) {
+            return Some(stored.name.clone());
+        }
+        if let Some(playing) = self.playing_rb.as_ref().filter(|rb| rb.id == id) {
+            return Some(playing.name.clone());
+        }
+        self.search_cache.get(id, time::Instant::now()).map(|rb| rb.name)
+    }
+
+    /// The id of the station that streams `url`: curated stations first (ROCK
+    /// before CLIAMP), then MY, then the Radio Browser station playing now.
+    pub fn station_id_for_url(&self, url: &str) -> Option<String> {
+        let curated = self
+            .rock_stations
+            .iter()
+            .chain(self.cliamp_stations.iter())
+            .find(|s| self.station_urls.get(&s.id).map(String::as_str) == Some(url));
+        if let Some(station) = curated {
+            return Some(station.id.clone());
+        }
+        if let Some(stored) = self.my.rb_entries().find(|stored| stored.url == url) {
+            return Some(stored.id.clone());
+        }
+        self.playing_rb.as_ref().filter(|rb| rb.url == url).map(|rb| rb.id.clone())
     }
 
     /// True for a ROCK or CLIAMP station id.
@@ -279,6 +312,16 @@ impl StationManager {
     /// A recent search result by id, if it has not expired.
     pub fn cached_search_result(&self, id: &str) -> Option<RbStation> {
         self.search_cache.get(id, time::Instant::now())
+    }
+
+    /// Records what is playing now: the freshly discovered Radio Browser
+    /// station if there is one, else the MY entry with this id (if any), so
+    /// a ROCK/CLIAMP station clears the previous Radio Browser one.
+    pub fn note_playing(&mut self, id: &str, discovered: Option<&RbStation>) {
+        self.playing_rb = match discovered {
+            Some(station) => Some(StoredRbStation::from_rb(station)),
+            None => self.my.get_rb(id).cloned(),
+        };
     }
 
     /// The registry as the API shows it: ROCK and CLIAMP flagged with `in_my`,
@@ -416,6 +459,7 @@ mod tests {
             remote_url: String::new(),
             my: MyStore::load(PathBuf::from("/nonexistent/my-stations.json")),
             search_cache: SearchCache::new(),
+            playing_rb: None,
         };
 
         manager.rebuild_url_map();
@@ -462,6 +506,7 @@ mod tests {
             remote_url: String::new(),
             my: MyStore::load(dir.join("my-stations.json")),
             search_cache: SearchCache::new(),
+            playing_rb: None,
         };
         manager.rebuild_url_map();
         manager
@@ -529,6 +574,51 @@ mod tests {
         assert_eq!(manager.get_station_url(&saved.id()), Some("https://jazz.example/stream"));
         assert_eq!(manager.get_station_url(&other.id()), None);
         assert_eq!(manager.cached_search_result(&other.id()), Some(other));
+    }
+
+    #[tokio::test]
+    async fn names_come_from_the_registry_my_the_playing_station_or_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let saved = rb_station(UUID_A, "https://jazz.example/stream");
+        let playing = rb_station("22222222-2222-2222-2222-222222222222", "https://p.example/s");
+        let cached = rb_station("33333333-3333-3333-3333-333333333333", "https://c.example/s");
+        manager.my_add(stored(&saved)).await.unwrap();
+        manager.note_playing(&playing.id(), Some(&playing));
+        manager.remember_search_results(std::slice::from_ref(&cached));
+
+        assert_eq!(manager.get_station_name("big100").as_deref(), Some("big100 name"));
+        assert_eq!(manager.get_station_name(&saved.id()).as_deref(), Some("Jazz FM"));
+        assert_eq!(manager.get_station_name(&playing.id()).as_deref(), Some("Jazz FM"));
+        assert_eq!(manager.get_station_name(&cached.id()).as_deref(), Some("Jazz FM"));
+        assert_eq!(manager.get_station_name("rb-44444444-4444-4444-4444-444444444444"), None);
+
+        manager.note_playing("big100", None);
+        assert_eq!(manager.get_station_name(&playing.id()), None);
+
+        manager.note_playing(&saved.id(), None);
+        manager.my_remove(&saved.id()).await.unwrap();
+        assert_eq!(
+            manager.get_station_name(&saved.id()).as_deref(),
+            Some("Jazz FM"),
+            "a station removed from MY keeps its name while it plays"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playing_url_maps_back_to_its_station_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = manager_in(dir.path());
+        let saved = rb_station(UUID_A, "https://jazz.example/stream");
+        let playing = rb_station("22222222-2222-2222-2222-222222222222", "https://p.example/s");
+        manager.my_add(stored(&saved)).await.unwrap();
+        manager.note_playing(&playing.id(), Some(&playing));
+
+        assert_eq!(manager.station_id_for_url("http://cliamp/lofi").as_deref(), Some("lofi"));
+        assert_eq!(manager.station_id_for_url("http://rock/big100").as_deref(), Some("big100"));
+        assert_eq!(manager.station_id_for_url("https://jazz.example/stream"), Some(saved.id()));
+        assert_eq!(manager.station_id_for_url("https://p.example/s"), Some(playing.id()));
+        assert_eq!(manager.station_id_for_url("https://nowhere.example/"), None);
     }
 
     #[tokio::test]

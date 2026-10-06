@@ -393,13 +393,7 @@ impl StateManager {
         let station_identity = player_state.station_url.as_ref().or(player_state.url.as_ref());
         let station = if let Some(url) = station_identity {
             // Try to match by URL
-            let matched = stations
-                .get_registry()
-                .groups
-                .iter()
-                .flat_map(|g| &g.stations)
-                .find(|s| stations.get_station_url(&s.id) == Some(url))
-                .map(|s| s.id.clone());
+            let matched = stations.station_id_for_url(url);
 
             if matched.is_some() {
                 matched
