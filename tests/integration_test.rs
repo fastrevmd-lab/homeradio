@@ -436,6 +436,10 @@ impl FakeRadioBrowser {
         self.answer_wrong_station.store(wrong, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn set_by_uuid_delay_ms(&self, delay_ms: u64) {
+        self.by_uuid_delay_ms.store(delay_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn by_uuid_call_count(&self) -> usize {
         self.by_uuid_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -574,6 +578,8 @@ async fn build_app_in(
         play_mutex: Arc::new(Mutex::new(())),
         policy_timing,
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        command_seq: Arc::default(),
+        completed_command_seq: Arc::default(),
         route: route_mock.clone(),
         route_tracking: Arc::default(),
         policy_completions: Arc::default(),
@@ -2724,6 +2730,80 @@ async fn a_lookup_that_answers_with_another_station_is_unknown_and_never_cached(
     assert_eq!(player_state.url, None);
     let body: serde_json::Value = app.server.get("/api/stations").await.json();
     assert_eq!(my_ids(&body), Vec::<String>::new());
+}
+
+// ---- Command ordering: the most recently arrived play/stop/power wins ----
+
+#[tokio::test]
+async fn a_slow_rb_play_cannot_undo_a_stop_that_arrived_after_it() {
+    let app = discovery_app().await;
+    app.radio_browser.set_by_uuid_delay_ms(300);
+    let slow_play = app.server.post("/api/play").json(&json!({"station": format!("rb-{JAZZ_UUID}")}));
+    let stop_later = async {
+        tokio::time::sleep(ms(80)).await;
+        app.server.post("/api/stop").await
+    };
+
+    let (play_response, stop_response) = tokio::join!(std::future::IntoFuture::into_future(slow_play), stop_later);
+
+    stop_response.assert_status_ok();
+    play_response.assert_status_ok();
+    assert_eq!(play_response.json::<serde_json::Value>()["player"]["state"], "stopped");
+    assert_eq!(count_events(&app.events, "player.play"), 0);
+    assert_eq!(cliamp::Player::state(app.player.as_ref()).await.state, "stopped");
+}
+
+#[tokio::test]
+async fn a_slow_rb_play_cannot_undo_a_newer_play() {
+    let app = discovery_app().await;
+    app.radio_browser.set_by_uuid_delay_ms(300);
+    let slow_play = app.server.post("/api/play").json(&json!({"station": format!("rb-{JAZZ_UUID}")}));
+    let newer_play = async {
+        tokio::time::sleep(ms(80)).await;
+        app.server.post("/api/play").json(&json!({"station": "test"})).await
+    };
+
+    let (slow_response, newer_response) = tokio::join!(std::future::IntoFuture::into_future(slow_play), newer_play);
+
+    newer_response.assert_status_ok();
+    slow_response.assert_status_ok();
+    assert_eq!(count_events(&app.events, "player.play"), 1);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("https://test.example.com/stream"));
+}
+
+#[tokio::test]
+async fn a_slow_rb_play_cannot_undo_a_master_power_off() {
+    let app = discovery_app().await;
+    app.radio_browser.set_by_uuid_delay_ms(300);
+    let slow_play = app.server.post("/api/play").json(&json!({"station": format!("rb-{JAZZ_UUID}")}));
+    let power_off = async {
+        tokio::time::sleep(ms(80)).await;
+        app.server.post("/api/power").json(&json!({"on": false})).await
+    };
+
+    let (_play_response, power_response) = tokio::join!(std::future::IntoFuture::into_future(slow_play), power_off);
+
+    power_response.assert_status_ok();
+    assert_eq!(count_events(&app.events, "player.play"), 0);
+    assert_eq!(cliamp::Player::state(app.player.as_ref()).await.state, "stopped");
+}
+
+#[tokio::test]
+async fn two_quick_plays_still_play_the_second_one() {
+    let app = discovery_app().await;
+    // Both ids resolve from memory (curated, search cache), so neither is slow.
+    app.server.get("/api/search").add_query_param("q", "blues").await.assert_status_ok();
+    let first = app.server.post("/api/play").json(&json!({"station": "test"}));
+    let second = app.server.post("/api/play").json(&json!({"station": format!("rb-{BLUES_UUID}")}));
+
+    let (first_response, second_response) = tokio::join!(std::future::IntoFuture::into_future(first), std::future::IntoFuture::into_future(second));
+
+    first_response.assert_status_ok();
+    second_response.assert_status_ok();
+    assert_eq!(count_events(&app.events, "player.play"), 2);
+    let player_state = cliamp::Player::state(app.player.as_ref()).await;
+    assert_eq!(player_state.url.as_deref(), Some("https://blues.example.com/live"));
 }
 
 #[tokio::test]

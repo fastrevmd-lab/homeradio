@@ -31,7 +31,7 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, WatchStream};
 use tokio_stream::{Stream, StreamExt};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Timing of the post-play zone policy. Production uses `Default`; tests shrink
 /// it so the background task finishes in milliseconds.
@@ -106,6 +106,12 @@ pub struct AppState {
     /// Bumped on every play, stop and power call. A background policy task exits
     /// as soon as the value it started with is no longer current.
     pub generation: Arc<AtomicU64>,
+    /// Arrival order of play, stop and master-power requests: each takes the next
+    /// number before doing any slow work (an `rb-` lookup can take seconds).
+    pub command_seq: Arc<AtomicU64>,
+    /// The highest `command_seq` whose command has taken effect. A play numbered
+    /// below it was overtaken by a newer command and must not start.
+    pub completed_command_seq: Arc<AtomicU64>,
     /// The AirPlay sink: connected on play, disconnected on stop.
     pub route: Arc<dyn AudioRoute>,
     pub route_tracking: Arc<StdMutex<RouteTracking>>,
@@ -118,6 +124,26 @@ pub struct AppState {
     pub radio_browser: Arc<dyn RadioBrowser>,
     /// Carries the `Stations` JSON to every SSE client after MY changes.
     pub stations_tx: broadcast::Sender<String>,
+}
+
+impl AppState {
+    /// Numbers a play, stop or master-power request by arrival.
+    fn next_command_seq(&self) -> u64 {
+        self.command_seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Records that command `seq` has taken effect.
+    fn complete_command(&self, seq: u64) {
+        self.completed_command_seq.fetch_max(seq, Ordering::SeqCst);
+    }
+
+    /// True when a command that arrived after `seq` has already taken effect.
+    /// Comparing arrival numbers (not "did anything change since I started")
+    /// keeps two quick plays working: the older one finishing first is not a
+    /// reason to drop the newer one.
+    fn is_superseded(&self, seq: u64) -> bool {
+        self.completed_command_seq.load(Ordering::SeqCst) > seq
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -413,6 +439,8 @@ async fn play_station(
     AxumState(state): AxumState<AppState>,
     Json(req): Json<PlayRequest>,
 ) -> Result<Json<State>, Response> {
+    // Number the request on arrival, before the (possibly slow) lookup below.
+    let command_seq = state.next_command_seq();
     // Resolve the id first: a Radio Browser lookup can take seconds and must not
     // hold up other plays. The client only ever supplies the id, never a URL.
     let (station_url, discovered) = match resolve_station(&state, &req.station).await? {
@@ -422,6 +450,14 @@ async fn play_station(
 
     // Serialize play operations
     let _guard = state.play_mutex.lock().await;
+
+    // A stop, power or newer play that arrived after this request and already ran
+    // wins; answer with the current state instead of starting a stale station.
+    if state.is_superseded(command_seq) {
+        info!("Play of {} superseded by a newer command", req.station);
+        state.state_manager.refresh().await;
+        return Ok(Json(state.state_manager.get_state().await));
+    }
 
     // Snapshot LIVE receiver state (the cache can be seconds old, and a
     // TV that just switched to hdmi1 must be seen as such).
@@ -445,6 +481,7 @@ async fn play_station(
     // The play is now committed: only here is the running policy task superseded,
     // so a rejected play (unknown station, no zone, receiver down) leaves it alone.
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.complete_command(command_seq);
 
     // Step 3: Bring the AirPlay sink up. This MUST come after the snapshot: the
     // receiver grabs both zones as soon as the sink connects.
@@ -505,9 +542,11 @@ async fn play_station(
 }
 
 async fn stop_player(AxumState(state): AxumState<AppState>) -> Result<Json<State>, Response> {
+    let command_seq = state.next_command_seq();
     // Serialize with play and power calls: each reads, then bumps the generation.
     let _guard = state.play_mutex.lock().await;
     state.generation.fetch_add(1, Ordering::SeqCst);
+    state.complete_command(command_seq);
     state.player.stop().await.map_err(|e| {
         error!("Failed to stop player: {}", e);
         error_response(
@@ -543,8 +582,10 @@ async fn set_master_power(
 ) -> Result<Json<State>, Response> {
     // Serialize with play, stop and zone toggles, and supersede any running
     // policy task so it cannot undo the power change.
+    let command_seq = state.next_command_seq();
     let _guard = state.play_mutex.lock().await;
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.complete_command(command_seq);
 
     if !req.on {
         // Try every step even if one fails, so a hiccup on one part never leaves
