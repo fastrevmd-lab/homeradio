@@ -2,6 +2,7 @@ pub mod api;
 pub mod cliamp;
 pub mod config;
 pub mod policy;
+pub mod radiobrowser;
 pub mod route;
 pub mod stations;
 pub mod state;
