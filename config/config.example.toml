@@ -1,0 +1,41 @@
+# Home Radio configuration example
+# Copy this file to /etc/home-radio/config.toml and adjust as needed
+
+# HTTP server bind address
+listen = "0.0.0.0:8080"
+
+# Yamaha receiver URL (Extended Control API). REQUIRED.
+# Change this to your receiver's IP. provision.sh also derives the AirPlay
+# sink address from the host part of this URL.
+receiver_url = "http://192.168.1.50"
+
+# Path to cliamp binary
+cliamp_bin = "/usr/local/bin/cliamp"
+
+# Path to stations TOML file
+stations_file = "/etc/home-radio/stations.toml"
+
+# Cache directory for remote station list
+cache_dir = "/var/lib/home-radio"
+
+# Remote stations URL (fetched every 6 hours)
+remote_stations_url = "https://radio.cliamp.stream/stations"
+
+# systemd USER unit that owns the AirPlay (RAOP) sink. radio-web starts it on
+# play, stops it on stop and restarts it when the receiver drops the session.
+raop_unit = "raop-sink.service"
+
+# Zone configuration
+# cap_db: maximum volume in dB (NEVER set above 0.0 for safety)
+# start_db: default volume when powering on from standby
+# label: display name for the zone
+
+[zones.main]
+cap_db = -15.0
+start_db = -35.0
+label = "Media Room"
+
+[zones.zone2]
+cap_db = 0.0
+start_db = -5.0
+label = "Upstairs"

@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HomeRadio</title>
+    <meta name="theme-color" content="#0B0D12">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'><rect width='120' height='120' fill='%230B0D12'/><path d='M18,96 L18,32 L60,74 L102,32 L102,96' fill='none' stroke='%234DD0C8' stroke-width='10' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+    <link rel="preload" href="fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="app.css">
+</head>
+<body>
+    <div class="boombox">
+        <!-- Carry handle -->
+        <div class="handle">
+            <div class="handle-grip"></div>
+        </div>
+
+        <!-- Main body container -->
+        <div class="boombox-body">
+            <!-- Left speakers: MEDIA ROOM -->
+            <div class="speaker speaker-left" data-zone="main">
+                <div class="tweeter-grille"><div class="tweeter"></div></div>
+                <div class="speaker-grille"><div class="woofer"></div></div>
+                <div class="speaker-grille"><div class="woofer"></div></div>
+            </div>
+
+            <!-- Center control panel -->
+            <div class="control-panel">
+                <!-- Brand plate -->
+                <div class="brand-row">
+                    <div class="brand-group">
+                        <div class="brand-plate">
+                            <svg class="brand-mark" viewBox="0 0 120 120" aria-hidden="true" focusable="false"><defs><linearGradient id="mesh" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4DD0C8"/><stop offset="1" stop-color="#0D9488"/></linearGradient></defs><path d="M18,96 L18,32 L60,74 L102,32 L102,96" fill="none" stroke="url(#mesh)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/><circle cx="18" cy="96" r="7" fill="#4DD0C8"/><circle cx="18" cy="32" r="7" fill="#4DD0C8"/><circle cx="102" cy="32" r="7" fill="#4DD0C8"/><circle cx="102" cy="96" r="7" fill="#4DD0C8"/><circle cx="60" cy="74" r="11" fill="#0D9488"/><circle cx="60" cy="74" r="5.5" fill="#B7F5F0"/></svg>
+                            <span class="brand-word"><span class="brand-home">Home</span><span class="brand-radio">Radio</span></span>
+                        </div>
+                        <!-- Master power: radio off + both zones standby, or wake the Media Room -->
+                        <button class="power-btn" id="powerBtn" type="button" aria-label="Receiver power" aria-pressed="false" disabled>
+                            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7.5 5.8a8 8 0 1 0 9 0" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path d="M12 3v8" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+                        </button>
+                    </div>
+                    <div class="badges">
+                        <span class="badge">HI-FI STEREO</span>
+                        <span class="badge">AUTO REVERSE</span>
+                    </div>
+                </div>
+                <!-- LCD now-playing display -->
+                <div class="lcd-display">
+                    <div class="lcd-content" role="status" aria-live="polite" aria-atomic="true">
+                        <div class="lcd-text" id="nowPlaying">READY</div>
+                    </div>
+                </div>
+
+                <!-- Spectrum analyser (decorative) + STEREO signal lamp -->
+                <div class="vis-window">
+                    <canvas class="vis-canvas" id="visCanvas" aria-hidden="true"></canvas>
+                    <div class="vis-foot">
+                        <span class="vis-scale" aria-hidden="true"><span>60</span><span>150</span><span>400</span><span>1K</span><span>2.4K</span><span>6K</span><span>15K</span></span>
+                        <span class="signal-lamp-container">
+                            <span class="signal-lamp" id="signalLamp" role="img" aria-label="Signal indicator"></span>
+                            <span class="signal-label">STEREO</span>
+                        </span>
+                    </div>
+                </div>
+
+                <!-- Tuning dial window -->
+                <div class="dial-window">
+                    <div class="dial-glass">
+                        <div class="dial-scale" id="dialScale">
+                            <!-- Station markers populated by JS -->
+                        </div>
+                        <div class="dial-needle" id="dialNeedle"></div>
+                        <div class="dial-frequencies">
+                            <span>88</span><span>92</span><span>96</span><span>100</span><span>104</span><span>108</span>
+                        </div>
+                    </div>
+                    <div
+                        class="dial-control"
+                        id="dialControl"
+                        role="slider"
+                        aria-label="Station tuner"
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                        aria-valuenow="0"
+                        tabindex="0"
+                    ></div>
+                </div>
+
+                <!-- Band switch -->
+                <div class="band-switch-container">
+                    <label class="band-switch">
+                        <input type="checkbox" id="bandSwitch" aria-label="Band selector">
+                        <span class="band-switch-slider">
+                            <span class="band-label-left">ROCK</span>
+                            <span class="band-label-right">CLIAMP</span>
+                        </span>
+                    </label>
+                </div>
+
+                <!-- Preset buttons (first 7 rock stations) -->
+                <div class="preset-buttons" id="presetButtons">
+                    <!-- Populated by JS -->
+                </div>
+
+                <!-- Transport controls -->
+                <div class="transport-controls">
+                    <button class="transport-btn play-btn" id="playBtn" aria-label="Play">
+                        <span class="btn-label">PLAY</span>
+                    </button>
+                    <button class="transport-btn stop-btn" id="stopBtn" aria-label="Stop">
+                        <span class="btn-label">STOP</span>
+                    </button>
+                </div>
+
+                <!-- Zone controls -->
+                <div class="zone-controls">
+                    <!-- Media Room zone -->
+                    <div class="zone">
+                        <div class="zone-header">
+                            <div class="pilot-led" id="mainLed" role="img" aria-label="Media Room power indicator"></div>
+                            <span class="zone-label">MEDIA ROOM</span>
+                        </div>
+                        <label class="zone-toggle">
+                            <input type="checkbox" id="mainToggle" aria-label="Media Room power">
+                            <span class="toggle-slider">
+                                <span class="toggle-label-off">OFF</span>
+                                <span class="toggle-label-on">ON</span>
+                            </span>
+                        </label>
+                        <div class="volume-knob-container">
+                            <div class="volume-knob" id="mainKnob"
+                                role="slider"
+                                aria-label="Media Room volume"
+                                aria-valuemin="-60"
+                                aria-valuemax="-15"
+                                aria-valuenow="-35"
+                                aria-valuetext="-35.0 dB"
+                                tabindex="0">
+                                <div class="knob-indicator"></div>
+                            </div>
+                            <div class="volume-label" id="mainVolumeLabel">-35.0 dB</div>
+                        </div>
+                    </div>
+
+                    <!-- Upstairs zone -->
+                    <div class="zone">
+                        <div class="zone-header">
+                            <div class="pilot-led" id="zone2Led" role="img" aria-label="Upstairs power indicator"></div>
+                            <span class="zone-label">UPSTAIRS</span>
+                        </div>
+                        <label class="zone-toggle">
+                            <input type="checkbox" id="zone2Toggle" aria-label="Upstairs power">
+                            <span class="toggle-slider">
+                                <span class="toggle-label-off">OFF</span>
+                                <span class="toggle-label-on">ON</span>
+                            </span>
+                        </label>
+                        <div class="volume-knob-container">
+                            <div class="volume-knob" id="zone2Knob"
+                                role="slider"
+                                aria-label="Upstairs volume"
+                                aria-valuemin="-60"
+                                aria-valuemax="0"
+                                aria-valuenow="-5"
+                                aria-valuetext="-5.0 dB"
+                                tabindex="0">
+                                <div class="knob-indicator"></div>
+                            </div>
+                            <div class="volume-label" id="zone2VolumeLabel">-5.0 dB</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right speakers: UPSTAIRS -->
+            <div class="speaker speaker-right" data-zone="zone2">
+                <div class="tweeter-grille"><div class="tweeter"></div></div>
+                <div class="speaker-grille"><div class="woofer"></div></div>
+                <div class="speaker-grille"><div class="woofer"></div></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

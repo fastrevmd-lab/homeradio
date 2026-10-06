@@ -1,0 +1,13 @@
+[Unit]
+Description=cliamp headless player (IPC daemon)
+After=pipewire.service wireplumber.service pipewire-pulse.socket
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Environment=CLIAMP_CONFIG_DIR=%h/.config/cliamp
+ExecStart=/usr/local/bin/cliamp --daemon --low-power --vol 0
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

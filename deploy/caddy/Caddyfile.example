@@ -1,0 +1,24 @@
+# Optional TLS front for radio-web. Copy to caddy/Caddyfile in the bundle to have
+# provision.sh install it (see deploy/provision.sh for the bundle layout).
+#
+# Caddy does no ACME of its own here: provide a certificate for your hostname
+# (from your own CA, certbot, ...) at /etc/caddy/certs/fullchain.pem and
+# /etc/caddy/certs/privkey.pem. Until both exist provision.sh leaves Caddy stopped.
+#
+# Change: radio.example.lan (your hostname) and 192.168.1.60 (this host's LAN IP).
+{
+	auto_https disable_redirects
+	admin off
+	# Clients that send no SNI (e.g. https://192.168.1.60) still get this cert
+	# instead of a TLS "internal error" alert.
+	default_sni radio.example.lan
+}
+
+radio.example.lan:443, 192.168.1.60:443 {
+	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+	encode gzip
+	reverse_proxy 127.0.0.1:8080 {
+		# SSE (/api/events, /api/vis) must stream, not buffer.
+		flush_interval -1
+	}
+}

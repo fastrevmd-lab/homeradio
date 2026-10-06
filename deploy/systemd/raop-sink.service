@@ -1,0 +1,9 @@
+[Unit]
+Description=AirPlay (RAOP) sink to the Yamaha receiver, started on demand by radio-web
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+
+[Service]
+ExecStart=/usr/bin/pipewire -c %h/.config/pipewire/raop-sink.conf
+Restart=on-failure
+RestartSec=2

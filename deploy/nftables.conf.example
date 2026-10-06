@@ -1,0 +1,39 @@
+#!/usr/sbin/nft -f
+# Optional firewall for the radio host: LAN-only web UI, AirPlay return traffic
+# from the receiver. Copy to nftables.conf in the bundle to have provision.sh
+# apply it (see deploy/provision.sh for the bundle layout). It REPLACES the
+# host's whole ruleset (flush ruleset), so merge it with any existing rules first.
+flush ruleset
+
+# Networks allowed to use the radio. Change to your own LAN(s).
+define LAN = { 192.168.1.0/24 }
+# Your receiver's IP: it sends AirPlay timing/control packets back over UDP.
+define RECEIVER = 192.168.1.50
+
+table inet filter {
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif lo accept
+    ct state established,related accept
+    ct state invalid drop
+    ip protocol icmp accept
+    meta l4proto ipv6-icmp accept
+    udp sport 67 udp dport 68 accept
+    # SSH from the LAN (change or remove).
+    ip saddr $LAN tcp dport 22 accept
+    ip saddr $LAN tcp dport { 443, 8080 } accept
+    ip saddr $RECEIVER udp dport 1024-65535 accept
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+  }
+}
+
+# Serve the UI on plain port 80 while radio-web stays unprivileged on 8080.
+# After the redirect the packet's dport is 8080, which the input chain allows.
+table ip nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    ip saddr $LAN tcp dport 80 redirect to :8080
+  }
+}

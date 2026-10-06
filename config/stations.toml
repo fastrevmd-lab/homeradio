@@ -1,0 +1,51 @@
+# Curated "ROCK" band. Order matters: the first 7 are the preset buttons.
+# Clients only ever send `id`; URLs never leave the server.
+
+[[station]]
+id = "big100"
+name = "BIG 100.3 – DC Classic Rock (WBIG)"
+short = "BIG 100"
+genre = "Classic Rock"
+url = "https://stream.revma.ihrhls.com/zc2505"
+
+[[station]]
+id = "wmtb"
+name = "WMTB 89.9 Emmitsburg – Classic Rock"
+short = "WMTB"
+genre = "Classic Rock"
+url = "https://stream.zeno.fm/vngdpfrorwutv"
+
+[[station]]
+id = "98rock"
+name = "98 Rock Baltimore (WIYY)"
+short = "98 ROCK"
+genre = "Rock"
+url = "https://playerservices.streamtheworld.com/api/livestream-redirect/WIYYFMAAC.aac"
+
+[[station]]
+id = "dc101"
+name = "DC101 – DC Alt Rock"
+short = "DC101"
+genre = "Alt Rock"
+url = "https://stream.revma.ihrhls.com/zc2525"
+
+[[station]]
+id = "kexp"
+name = "KEXP 90.3 Seattle"
+short = "KEXP"
+genre = "Eclectic"
+url = "https://kexp.streamguys1.com/kexp160.aac"
+
+[[station]]
+id = "rprock"
+name = "Radio Paradise Rock Mix"
+short = "RP ROCK"
+genre = "Rock"
+url = "https://stream.radioparadise.com/rock-320"
+
+[[station]]
+id = "labgate"
+name = "Labgate – Alt Rock Grunge"
+short = "LABGATE"
+genre = "Grunge"
+url = "https://s2.ssl-stream.com/radio/8190/radio.mp3"

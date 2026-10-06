@@ -1,0 +1,15 @@
+[Unit]
+Description=home-radio web UI and API (:8080)
+After=cliamp.service
+Wants=cliamp.service
+
+[Service]
+Environment=CLIAMP_CONFIG_DIR=%h/.config/cliamp
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/radio-web --config /etc/home-radio/config.toml
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
