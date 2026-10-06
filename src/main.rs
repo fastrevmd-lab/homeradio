@@ -108,6 +108,8 @@ async fn main() -> anyhow::Result<()> {
         route_tracking: Arc::default(),
         policy_completions: Arc::default(),
         vis,
+        radio_browser: Arc::new(radiobrowser::HttpRadioBrowser::connect().await),
+        stations_tx: tokio::sync::broadcast::channel(16).0,
     };
 
     // Watch for a receiver that stops pulling audio while cliamp plays

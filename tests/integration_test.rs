@@ -386,6 +386,84 @@ struct TestApp {
     route: Arc<MockAudioRoute>,
     player: Arc<MockPlayer>,
     events: Events,
+    /// Owns the cache dir (and `my-stations.json`); gone when the test ends.
+    _cache_dir: Option<tempfile::TempDir>,
+}
+
+/// Radio Browser stand-in: serves a fixed list, can be switched off, and
+/// records what it was asked.
+struct FakeRadioBrowser {
+    stations: Vec<radiobrowser::RbStation>,
+    down: std::sync::atomic::AtomicBool,
+    by_uuid_calls: std::sync::atomic::AtomicUsize,
+    searches: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+}
+
+impl FakeRadioBrowser {
+    fn new(stations: Vec<radiobrowser::RbStation>) -> Self {
+        Self {
+            stations,
+            down: std::sync::atomic::AtomicBool::new(false),
+            by_uuid_calls: std::sync::atomic::AtomicUsize::new(0),
+            searches: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn is_down(&self) -> bool {
+        self.down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl radiobrowser::RadioBrowser for FakeRadioBrowser {
+    async fn search(
+        &self,
+        name: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<Vec<radiobrowser::RbStation>, radiobrowser::RbError> {
+        self.searches
+            .lock()
+            .unwrap()
+            .push((name.map(str::to_string), tag.map(str::to_string)));
+        if self.is_down() {
+            return Err(radiobrowser::RbError::Unavailable("fake outage".to_string()));
+        }
+        Ok(self.stations.clone())
+    }
+
+    async fn by_uuid(&self, uuid: &str) -> Result<Option<radiobrowser::RbStation>, radiobrowser::RbError> {
+        self.by_uuid_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.is_down() {
+            return Err(radiobrowser::RbError::Unavailable("fake outage".to_string()));
+        }
+        Ok(self.stations.iter().find(|station| station.uuid == uuid).cloned())
+    }
+}
+
+/// UUID of the first fake station.
+const JAZZ_UUID: &str = "11111111-1111-1111-1111-111111111111";
+/// UUID of the second fake station.
+const BLUES_UUID: &str = "22222222-2222-2222-2222-222222222222";
+
+fn fake_stations() -> Vec<radiobrowser::RbStation> {
+    vec![
+        radiobrowser::RbStation {
+            uuid: JAZZ_UUID.to_string(),
+            name: "Smooth Jazz Radio".to_string(),
+            genre: "jazz".to_string(),
+            country: "Canada".to_string(),
+            bitrate: 128,
+            url: "http://jazz.example.com/stream".to_string(),
+        },
+        radiobrowser::RbStation {
+            uuid: BLUES_UUID.to_string(),
+            name: "Blues Highway".to_string(),
+            genre: "blues".to_string(),
+            country: "USA".to_string(),
+            bitrate: 64,
+            url: "https://blues.example.com/live".to_string(),
+        },
+    ]
 }
 
 // Helper to create test app
@@ -405,6 +483,20 @@ async fn build_app(
     policy_timing: api::PolicyTiming,
     grab_zones: Option<Arc<Mutex<HashMap<String, yxc::ZoneStatus>>>>,
 ) -> TestApp {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut app = build_app_in(cache_dir.path(), yxc, policy_timing, grab_zones).await;
+    app._cache_dir = Some(cache_dir);
+    app
+}
+
+/// Like `build_app`, but on a caller-owned cache dir, so a test can start a
+/// second app on the same `my-stations.json` (a restart).
+async fn build_app_in(
+    test_dir: &std::path::Path,
+    yxc: Arc<dyn yxc::YxcClient>,
+    policy_timing: api::PolicyTiming,
+    grab_zones: Option<Arc<Mutex<HashMap<String, yxc::ZoneStatus>>>>,
+) -> TestApp {
     let config = config::Config::with_receiver_url("http://192.0.2.10");
     let events: Events = Arc::default();
     let player_mock = Arc::new(MockPlayer::new(events.clone()));
@@ -414,14 +506,7 @@ async fn build_app(
         ..MockAudioRoute::new(events.clone())
     });
 
-    // Create a minimal stations manager with unique temp directory
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-
-    let test_dir = std::env::temp_dir().join(format!("radio_test_{}", id));
-    std::fs::create_dir_all(&test_dir).unwrap();
-
+    // Create a minimal stations manager in the given cache dir
     let stations_file = test_dir.join("stations.toml");
     std::fs::write(
         &stations_file,
@@ -430,7 +515,7 @@ async fn build_app(
     .unwrap();
 
     let stations = Arc::new(RwLock::new(
-        stations::StationManager::new(&stations_file, &test_dir, "http://localhost".to_string())
+        stations::StationManager::new(&stations_file, test_dir, "http://localhost".to_string())
             .await
             .unwrap(),
     ));
@@ -462,6 +547,8 @@ async fn build_app(
             player_mock.clone() as Arc<dyn cliamp::Player>,
             vis::VisConfig::default(),
         ),
+        radio_browser: Arc::new(FakeRadioBrowser::new(fake_stations())),
+        stations_tx: tokio::sync::broadcast::channel(16).0,
     };
 
     TestApp {
@@ -470,6 +557,7 @@ async fn build_app(
         route: route_mock,
         player: player_mock,
         events,
+        _cache_dir: None,
     }
 }
 
@@ -2228,4 +2316,27 @@ async fn test_power_and_stop_wait_for_the_play_mutex() {
 
     assert_eq!(count_calls(&calls, "set_power main false"), 1);
     assert_eq!(count_events(&app.events, "player.stop"), 1);
+}
+
+// ---- Station discovery: search ----
+
+async fn discovery_app() -> TestApp {
+    build_app(Arc::new(MockYxcClient::new()), fast_timing(), None).await
+}
+
+#[tokio::test]
+async fn stations_view_has_an_empty_my_group_and_in_my_flags() {
+    let app = discovery_app().await;
+
+    let response = app.server.get("/api/stations").await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    let groups = body["groups"].as_array().unwrap();
+    let my = groups.iter().find(|group| group["id"] == "my").unwrap();
+    assert_eq!(my["label"], "MY");
+    assert_eq!(my["stations"].as_array().unwrap().len(), 0);
+    let first_curated = &groups[0]["stations"][0];
+    assert_eq!(first_curated["id"], "test");
+    assert_eq!(first_curated["in_my"], false);
 }

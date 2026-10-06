@@ -3,9 +3,10 @@
 use crate::cliamp::Player;
 use crate::config::Config;
 use crate::policy::{self, ZoneSelection, ZoneSnapshot};
+use crate::radiobrowser::RadioBrowser;
 use crate::route::AudioRoute;
 use crate::state::{State, StateManager, ZoneLive, ZoneOverride};
-use crate::stations::StationManager;
+use crate::stations::{RegistryView, StationManager};
 use crate::vis::VisHub;
 use crate::volume;
 use crate::yxc::{YxcClient, YxcError};
@@ -25,7 +26,7 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tokio_stream::{Stream, StreamExt};
@@ -112,6 +113,10 @@ pub struct AppState {
     pub policy_completions: Arc<AtomicU64>,
     /// Shared spectrum feed behind `GET /api/vis`.
     pub vis: Arc<VisHub>,
+    /// Radio Browser, behind a trait so tests can substitute a fake.
+    pub radio_browser: Arc<dyn RadioBrowser>,
+    /// Carries the `Stations` JSON to every SSE client after MY changes.
+    pub stations_tx: broadcast::Sender<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,11 +187,9 @@ async fn get_state(AxumState(state): AxumState<AppState>) -> Json<State> {
     Json(state.state_manager.get_state().await)
 }
 
-async fn get_stations(
-    AxumState(state): AxumState<AppState>,
-) -> Json<crate::stations::StationRegistry> {
+async fn get_stations(AxumState(state): AxumState<AppState>) -> Json<RegistryView> {
     let stations = state.stations.read().await;
-    Json(stations.get_registry())
+    Json(stations.registry_view())
 }
 
 async fn play_station(
