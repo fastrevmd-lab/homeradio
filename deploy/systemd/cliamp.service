@@ -5,6 +5,8 @@ Wants=pipewire.service wireplumber.service
 
 [Service]
 Environment=CLIAMP_CONFIG_DIR=%h/.config/cliamp
+# A pidfile left by a previous boot can name a PID now reused by another process; cliamp then refuses to start.
+ExecStartPre=/bin/rm -f %h/.config/cliamp/cliamp.sock %h/.config/cliamp/cliamp.sock.pid
 ExecStart=/usr/local/bin/cliamp --daemon --low-power --vol 0
 Restart=always
 RestartSec=3
